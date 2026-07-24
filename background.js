@@ -10,11 +10,12 @@ const PROXY_MODES = { SYSTEM: 'system', FIXED: 'fixed', DIRECT: 'direct' };
 const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview', PROD: 'prod' };
 const LEGACY_STATE_MAP = { testing: STATES.OFF, prod_local: STATES.PREVIEW };
 
+// badge*: exact popup badge CSS colors (light / dark variants)
 const STATE_CONFIG = {
-  [STATES.OFF]:        { color: '#94A3B8', label: 'OFF',   title: 'Off',              cookie: false, proxy: PROXY_MODES.SYSTEM, cache: true },
-  [STATES.DEV]:        { color: '#22C55E', label: 'DEV',   title: 'Development Mode', cookie: true,  proxy: PROXY_MODES.FIXED,  cache: false },
-  [STATES.PREVIEW]:    { color: '#EAB308', label: 'PREV',  title: 'Preview Mode',     cookie: false, proxy: PROXY_MODES.FIXED,  cache: false },
-  [STATES.PROD]:       { color: '#EF4444', label: 'PROD',  title: 'Production Mode',  cookie: false, proxy: PROXY_MODES.DIRECT, cache: false }
+  [STATES.OFF]:     { color: '#94A3B8', label: 'OFF', badgeBgLight: 'rgba(158,158,158,0.15)', badgeTextLight: '#5f6368', badgeBgDark: 'rgba(158,158,158,0.20)', badgeTextDark: '#bdbdbd', title: 'Off',              cookie: false, proxy: PROXY_MODES.SYSTEM, cache: true },
+  [STATES.DEV]:     { color: '#22C55E', label: 'DEV', badgeBgLight: 'rgba(0,200,83,0.15)',    badgeTextLight: '#00a344', badgeBgDark: 'rgba(0,200,83,0.20)',    badgeTextDark: '#69f0ae', title: 'Development Mode', cookie: true,  proxy: PROXY_MODES.FIXED,  cache: false },
+  [STATES.PREVIEW]: { color: '#EAB308', label: 'PRE', badgeBgLight: 'rgba(234,179,8,0.18)',   badgeTextLight: '#a16207', badgeBgDark: 'rgba(234,179,8,0.24)',   badgeTextDark: '#facc15', title: 'Preview Mode',     cookie: false, proxy: PROXY_MODES.FIXED,  cache: false },
+  [STATES.PROD]:    { color: '#EF4444', label: 'PRO', badgeBgLight: 'rgba(211,47,47,0.15)',   badgeTextLight: '#c62828', badgeBgDark: 'rgba(211,47,47,0.20)',   badgeTextDark: '#ef9a9a', title: 'Production Mode',  cookie: false, proxy: PROXY_MODES.DIRECT, cache: false }
 };
 
 function normalizeState(state) {
@@ -22,48 +23,30 @@ function normalizeState(state) {
   return STATE_CONFIG[migratedState] ? migratedState : STATES.OFF;
 }
 
+let prefersDark = self.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+
 // Generate a single icon ImageData at the given pixel size
 function generateIconSize(state, size) {
   const canvas = new OffscreenCanvas(size, size);
   const ctx = canvas.getContext('2d');
-  const { color } = STATE_CONFIG[state];
-  const cx = size / 2;
-  const cy = size / 2;
+  const cfg = STATE_CONFIG[state];
+  const badgeBg   = prefersDark ? cfg.badgeBgDark   : cfg.badgeBgLight;
+  const badgeText = prefersDark ? cfg.badgeTextDark  : cfg.badgeTextLight;
+  const { label } = cfg;
 
-  // Flat background
+  // Badge chip — exact popup badge colors, composited by Chrome on the toolbar
   ctx.beginPath();
   ctx.roundRect(0, 0, size, size, size * 0.26);
-  ctx.fillStyle = color;
+  ctx.fillStyle = badgeBg;
   ctx.fill();
 
-  // </> symbol
-  ctx.strokeStyle = 'rgba(255,255,255,0.92)';
-  ctx.lineCap     = 'round';
-  ctx.lineJoin    = 'round';
-  const lw = Math.max(1.2, size * 0.092);
-  const h  = size * 0.21;
-  ctx.lineWidth = lw;
-
-  // <
-  ctx.beginPath();
-  ctx.moveTo(cx - size * 0.13, cy - h);
-  ctx.lineTo(cx - size * 0.29, cy);
-  ctx.lineTo(cx - size * 0.13, cy + h);
-  ctx.stroke();
-
-  // >
-  ctx.beginPath();
-  ctx.moveTo(cx + size * 0.13, cy - h);
-  ctx.lineTo(cx + size * 0.29, cy);
-  ctx.lineTo(cx + size * 0.13, cy + h);
-  ctx.stroke();
-
-  // /
-  ctx.lineWidth = lw * 0.78;
-  ctx.beginPath();
-  ctx.moveTo(cx + size * 0.052, cy - h * 0.87);
-  ctx.lineTo(cx - size * 0.052, cy + h * 0.87);
-  ctx.stroke();
+  // Badge text label
+  const fontSize = Math.round(size * 0.42);
+  ctx.font = `700 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  ctx.fillStyle = badgeText;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, size / 2, size / 2 + size * 0.02);
 
   return ctx.getImageData(0, 0, size, size);
 }
@@ -218,6 +201,12 @@ chrome.runtime.onMessage.addListener((msg, _, respond) => {
   }
   if (msg.action === 'getState') {
     chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      if (typeof msg.prefersDark === 'boolean' && msg.prefersDark !== prefersDark) {
+        prefersDark = msg.prefersDark;
+        const domain = tab?.url ? extractDomain(tab.url) : null;
+        const state = domain ? await getState(domain) : STATES.OFF;
+        if (isActionableUrl(tab?.url)) updateIcon(state);
+      }
       const domain = tab?.url ? extractDomain(tab.url) : null;
       respond({ state: domain ? await getState(domain) : STATES.OFF });
     });

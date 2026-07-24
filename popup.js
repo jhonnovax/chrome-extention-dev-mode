@@ -1,6 +1,7 @@
 // Get current state and update UI
 async function updateUI() {
-  const response = await chrome.runtime.sendMessage({ action: 'getState' });
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const response = await chrome.runtime.sendMessage({ action: 'getState', prefersDark });
   const currentState = response?.state || 'off';
 
   document.querySelectorAll('.menu-item').forEach(item => {
