@@ -34,14 +34,18 @@ function generateIconSize(state, size) {
   const badgeText = prefersDark ? cfg.badgeTextDark  : cfg.badgeTextLight;
   const { label } = cfg;
 
-  // Badge chip — exact popup badge colors, composited by Chrome on the toolbar
+  // Badge chip — full canvas size, no outer margin
   ctx.beginPath();
-  ctx.roundRect(0, 0, size, size, size * 0.26);
+  ctx.roundRect(0, 0, size, size, size * 0.28);
   ctx.fillStyle = badgeBg;
   ctx.fill();
 
-  // Badge text label
-  const fontSize = Math.round(size * 0.42);
+  // Border to lift the chip off the toolbar
+  ctx.strokeStyle = prefersDark ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.12)';
+  ctx.lineWidth = Math.max(1, size * 0.04);
+  ctx.stroke();
+
+  const fontSize = Math.round(size * 0.44);
   ctx.font = `700 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
   ctx.fillStyle = badgeText;
   ctx.textAlign = 'center';
@@ -56,6 +60,8 @@ function generateIcons(state) {
   return {
     16:  generateIconSize(state, 16),
     32:  generateIconSize(state, 32),
+    48:  generateIconSize(state, 48),
+    64:  generateIconSize(state, 64),
     128: generateIconSize(state, 128)
   };
 }
