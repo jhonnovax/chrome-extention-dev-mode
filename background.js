@@ -8,7 +8,6 @@ const PROXY_PORT = 8888;
 
 const PROXY_MODES = { SYSTEM: 'system', FIXED: 'fixed', DIRECT: 'direct' };
 const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview', PROD: 'prod' };
-const LEGACY_STATE_MAP = { testing: STATES.OFF, prod_local: STATES.PREVIEW };
 
 // badge*: exact popup badge CSS colors (light / dark variants)
 const STATE_CONFIG = {
@@ -19,8 +18,7 @@ const STATE_CONFIG = {
 };
 
 function normalizeState(state) {
-  const migratedState = LEGACY_STATE_MAP[state] || state;
-  return STATE_CONFIG[migratedState] ? migratedState : STATES.OFF;
+  return STATE_CONFIG[state] ? state : STATES.OFF;
 }
 
 let prefersDark = self.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
@@ -34,14 +32,16 @@ function generateIconSize(state, size) {
   const badgeText = prefersDark ? cfg.badgeTextDark  : cfg.badgeTextLight;
   const { label } = cfg;
 
-  // Badge chip — full canvas size, no outer margin
+  // Badge chip — solid base first so semi-transparent color is toolbar-independent
   ctx.beginPath();
   ctx.roundRect(0, 0, size, size, size * 0.28);
+  ctx.fillStyle = prefersDark ? '#1e1f21' : '#ffffff';
+  ctx.fill();
   ctx.fillStyle = badgeBg;
   ctx.fill();
 
   // Border to lift the chip off the toolbar
-  ctx.strokeStyle = prefersDark ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.12)';
+  ctx.strokeStyle = prefersDark ? 'rgba(255, 255, 255, 0.18)' : 'rgba(0, 0, 0, 0.15)';
   ctx.lineWidth = Math.max(1, size * 0.04);
   ctx.stroke();
 
@@ -171,11 +171,10 @@ async function updateIconForActiveTab() {
   if (!tab) return;
 
   if (!isActionableUrl(tab.url)) {
-    chrome.action.disable(tab.id);
+    updateIcon(STATES.OFF);
     return;
   }
 
-  chrome.action.enable(tab.id);
   const domain = extractDomain(tab.url);
   const state  = domain ? await getState(domain) : STATES.OFF;
   updateIcon(state);
@@ -237,11 +236,10 @@ chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
 
   if (!isActionableUrl(changeInfo.url)) {
-    chrome.action.disable(_tabId);
+    updateIcon(STATES.OFF);
     return;
   }
 
-  chrome.action.enable(_tabId);
   const domain = extractDomain(changeInfo.url);
   if (!domain) return;
 
