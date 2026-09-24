@@ -222,6 +222,7 @@ async function pushServerConfig() {
 // the local file (Fetch.fulfillRequest); Rewrite changes the URL invisibly (Fetch.continueRequest).
 
 const attachedTabs = new Set();
+const tabStates = new Map(); // tabId -> state the interception was enabled with
 const userDetachedTabs = new Set();
 const warnedUrls = new Set();
 let keepAliveTimer = null;
@@ -252,6 +253,7 @@ async function interceptPatterns(state) {
 }
 
 async function enableInterception(tabId, state) {
+  tabStates.set(tabId, state);
   const patterns = await interceptPatterns(state);
   if (!patterns.length) {
     await sendCommand(tabId, 'Fetch.disable').catch(() => {});
@@ -319,6 +321,7 @@ async function attachTab(tabId, state, { reloadAfter = false } = {}) {
 // but the debugger session is not, so it must not be the only source of truth
 async function detachTab(tabId) {
   const known = attachedTabs.delete(tabId);
+  tabStates.delete(tabId);
   updateKeepAlive();
   try {
     await chrome.debugger.detach({ tabId });
@@ -384,13 +387,22 @@ async function onRequestPaused(tabId, params) {
   }
 
   try {
-    const [state, settings] = await Promise.all([stateForUrl(request.url), getSettings()]);
+    // The mode belongs to the page (tab), not to the request's host: assets may come from a CDN
+    let state = tabStates.get(tabId);
+    if (!state) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      state = await stateForUrl(tab?.url);
+      tabStates.set(tabId, state);
+    }
+    const settings = await getSettings();
     if (state === STATES.OFF) return finish('Fetch.continueRequest');
 
     const rewritten = applyRewrites(request.url, settings, state);
     const local = mapLocalTarget(rewritten, settings, state);
     const isDocument = params.resourceType === 'Document';
-    if (isDocument) console.info(`[Dev Mode] document ${request.url} (${state}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
+    if (isDocument || local || rewritten !== request.url) {
+      console.info(`[Dev Mode] ${params.resourceType} ${request.url} (${state}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
+    }
 
     if (local) {
       let res = null;
@@ -417,8 +429,10 @@ async function onRequestPaused(tabId, params) {
       }
       if (res && (isDocument || !warnedUrls.has(rewritten))) {
         warnedUrls.add(rewritten);
-        console.warn(`[Dev Mode] No local file for ${rewritten} (${res.status}); serving from the real site.`);
+        console.warn(`[Dev Mode] No local file for ${rewritten} (${res.status}); serving ${request.url} from the real site.`);
       }
+      // The rewrite existed to reach the local file; without it, ask the real site for the original URL
+      return finish('Fetch.continueRequest');
     }
 
     if (rewritten !== request.url) return finish('Fetch.continueRequest', { url: rewritten });
@@ -437,6 +451,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId == null) return;
   console.info(`[Dev Mode] Chrome detached tab ${source.tabId}: ${reason}`);
   attachedTabs.delete(source.tabId);
+  tabStates.delete(source.tabId);
   updateKeepAlive();
   // User clicked "Cancel" on the debugging bar: leave the tab alone until it navigates again
   if (reason === 'canceled_by_user') userDetachedTabs.add(source.tabId);
@@ -616,6 +631,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
+  tabStates.delete(tabId);
   userDetachedTabs.delete(tabId);
   updateKeepAlive();
 });
