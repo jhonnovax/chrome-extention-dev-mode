@@ -3,6 +3,7 @@ const COOKIE_NAME = 'htm-dev-mode';
 const COOKIE_VALUE = '4815162342';
 const STORAGE_KEY = 'domainStates';
 const SETTINGS_KEY = 'settings';
+const GLOBALS_KEY = 'globals';
 const LOCAL_HOST = '127.0.0.1';
 const LOCAL_PORT = 4815;
 const LOCAL_ORIGIN = `http://${LOCAL_HOST}:${LOCAL_PORT}`;
@@ -124,6 +125,59 @@ async function getSettings() {
   const seeded = structuredClone(DEFAULT_SETTINGS);
   await chrome.storage.local.set({ [SETTINGS_KEY]: seeded });
   return seeded;
+}
+
+// ---- Global variable overrides (per root domain, any mode) ----
+// Stored as { '.on24.com': [{ name, value }] } with `value` the raw string typed in the popup
+
+async function getGlobals(domain) {
+  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
+  return Array.isArray(all[domain]) ? all[domain] : [];
+}
+
+async function saveGlobals(domain, list) {
+  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
+  if (list.length) all[domain] = list;
+  else delete all[domain];
+  await chrome.storage.local.set({ [GLOBALS_KEY]: all });
+}
+
+// chrome.userScripts is only exposed while the "Allow User Scripts" toggle is on (Chrome 138+)
+function userScriptsAvailable() {
+  try {
+    return !!chrome.userScripts;
+  } catch {
+    return false;
+  }
+}
+
+// `true`, `42`, `"text"`, `{"a":1}` become real values; anything else stays a string
+function parseGlobalValue(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+// Snippet run in the page's MAIN world at document_start: each variable becomes a locked accessor
+// on window, so later assignments by page code are ignored and the override survives the page's life
+function buildGlobalsCode(list) {
+  const vars = {};
+  for (const { name, value } of list) {
+    if (typeof name === 'string' && name.trim()) vars[name.trim()] = parseGlobalValue(String(value ?? ''));
+  }
+  return `(() => {
+  const vars = ${JSON.stringify(vars)};
+  for (const key of Object.keys(vars)) {
+    const value = vars[key];
+    try {
+      Object.defineProperty(window, key, { get: () => value, set() {}, configurable: true, enumerable: true });
+    } catch (e) {
+      try { window[key] = value; } catch {}
+    }
+  }
+})();`;
 }
 
 // State for a URL (OFF for anything the extension can't act on)
@@ -496,6 +550,78 @@ function scheduleSync() {
   return syncQueue;
 }
 
+// ---- userScripts: one MAIN-world document_start script per domain with global overrides ----
+// Independent of the debugger/Fetch path: works in every mode, including OFF.
+
+let warnedUserScripts = false;
+
+async function syncGlobals() {
+  if (!userScriptsAvailable()) {
+    if (!warnedUserScripts) {
+      warnedUserScripts = true;
+      console.warn('[Dev Mode] chrome.userScripts unavailable: enable "Allow User Scripts" in the extension details to inject global variables.');
+    }
+    return;
+  }
+  warnedUserScripts = false;
+
+  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
+  const scripts = [];
+  for (const [rawDomain, list] of Object.entries(all)) {
+    const domain = rawDomain.replace(/^\./, '');
+    if (!domain || !Array.isArray(list) || !list.length) continue;
+    scripts.push({
+      id: `globals:${domain}`,
+      matches: [`*://*.${domain}/*`, `*://${domain}/*`],
+      js: [{ code: buildGlobalsCode(list) }],
+      runAt: 'document_start',
+      world: 'MAIN',
+      allFrames: true
+    });
+  }
+
+  await chrome.userScripts.unregister();
+  if (scripts.length) {
+    try {
+      await chrome.userScripts.register(scripts);
+    } catch (err) {
+      console.error(`[Dev Mode] userScripts.register failed: ${err?.message}`, scripts);
+      throw err;
+    }
+  }
+  console.info(`[Dev Mode] global overrides registered for: ${scripts.map(s => s.id.slice(8)).join(', ') || 'none'}`);
+}
+
+let globalsQueue = Promise.resolve();
+function scheduleGlobalsSync() {
+  globalsQueue = globalsQueue.then(syncGlobals).catch(err => console.error('[Dev Mode] syncGlobals failed', err));
+  return globalsQueue;
+}
+
+// Popup: replace the active tab domain's variable list, re-register and reload so it applies now
+async function setGlobals(list) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const domain = isActionableUrl(tab?.url) ? extractDomain(tab.url) : null;
+  if (!domain) return { success: false, globals: [] };
+
+  const clean = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    // "window.isNurturePage" and "isNurturePage" mean the same global
+    const name = String(entry?.name ?? '').trim().replace(/^(window|self|globalThis)\./, '');
+    if (!name) continue;
+    const value = String(entry?.value ?? '');
+    const existing = clean.findIndex(e => e.name === name);
+    if (existing >= 0) clean[existing] = { name, value };
+    else clean.push({ name, value });
+  }
+
+  console.info(`[Dev Mode] setGlobals ${domain}:`, clean.map(e => `${e.name}=${e.value}`).join(', ') || '(none)');
+  await saveGlobals(domain, clean);
+  await scheduleGlobalsSync();
+  chrome.tabs.reload(tab.id).catch(() => {});
+  return { success: true, globals: clean };
+}
+
 // Ports the given state relies on: [LOCAL_PORT] when any map-local rule is active, else []
 async function localPortsForState(state) {
   const settings = await getSettings();
@@ -555,8 +681,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
         prefersDark = msg.prefersDark;
         if (domain) updateIcon(state);
       }
-      respond({ state, ports: await localPortsForState(state) });
+      respond({
+        state,
+        domain,
+        ports: await localPortsForState(state),
+        globals: domain ? await getGlobals(domain) : [],
+        userScripts: userScriptsAvailable()
+      });
     });
+    return true;
+  }
+  if (msg.action === 'setGlobals') {
+    setGlobals(msg.globals).then(respond);
+    return true;
+  }
+  if (msg.action === 'openExtensionDetails') {
+    chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` }).then(() => respond({ ok: true }));
     return true;
   }
   if (msg.action === 'getDefaultSettings') {
@@ -577,6 +717,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     ensureReady().then(syncAllTabs);
   }
   if (changes[SETTINGS_KEY]) pushServerConfig();
+  if (changes[GLOBALS_KEY]) scheduleGlobalsSync();
 });
 
 // Apply cookie at multiple points to ensure it's set before request goes out
@@ -643,6 +784,7 @@ chrome.tabs.onActivated.addListener(() => updateIconForActiveTab());
 function init() {
   updateIconForActiveTab();
   scheduleSync();
+  scheduleGlobalsSync();
   pushServerConfig();
   ensureReady();
 }

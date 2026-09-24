@@ -1,15 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Dev Mode",
-  "version": "1.2.0",
-  "description": "Toggle DEV mode cookie, map-local and rewrite rules",
+  "version": "1.3.0",
+  "description": "Toggle DEV mode cookie, map-local and rewrite rules, global variable overrides",
   "permissions": [
     "cookies",
     "debugger",
     "declarativeNetRequest",
     "tabs",
     "webNavigation",
-    "storage"
+    "storage",
+    "userScripts"
   ],
   "host_permissions": [
     "<all_urls>"

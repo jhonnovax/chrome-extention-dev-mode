@@ -25,6 +25,79 @@ async function updateServerStatus(ports = []) {
     : `Local server ${results.map(r => `:${r.port}`).join(', ')} running`;
 }
 
+// ---- Global variable overrides (per domain, any mode) ----
+
+const globalsEl = document.getElementById('globals');
+const globalsList = document.getElementById('globals-list');
+const globalsForm = document.getElementById('globals-add');
+const globalsName = document.getElementById('globals-name');
+const globalsValue = document.getElementById('globals-value');
+
+let globals = [];
+
+function renderGlobals(list, { domain, userScripts } = {}) {
+  globals = Array.isArray(list) ? list : [];
+  globalsEl.hidden = !domain;
+  globalsEl.classList.toggle('unsupported', userScripts === false);
+  globalsList.textContent = '';
+
+  for (const entry of globals) {
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = entry.name;
+    name.title = entry.name;
+
+    const eq = document.createElement('span');
+    eq.className = 'eq';
+    eq.textContent = '=';
+
+    const value = document.createElement('span');
+    value.className = 'value';
+    value.textContent = entry.value;
+    value.title = entry.value;
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn remove';
+    remove.title = 'Remove variable';
+    remove.textContent = '×';
+    remove.addEventListener('click', () => saveGlobals(globals.filter(e => e !== entry)));
+
+    row.append(name, eq, value, remove);
+    globalsList.appendChild(row);
+  }
+}
+
+// Background stores the list, re-registers the user script and reloads the tab
+async function saveGlobals(list) {
+  const response = await chrome.runtime.sendMessage({ action: 'setGlobals', globals: list });
+  if (response?.success) renderGlobals(response.globals, { domain: true, userScripts: !globalsEl.classList.contains('unsupported') });
+}
+
+globalsForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const name = globalsName.value.trim().replace(/^(window|self|globalThis)\./, '');
+  if (!name) {
+    globalsName.focus();
+    return;
+  }
+  const value = globalsValue.value;
+  const next = globals.filter(e => e.name !== name);
+  next.push({ name, value });
+  globalsName.value = '';
+  globalsValue.value = '';
+  globalsName.focus();
+  saveGlobals(next);
+});
+
+document.getElementById('globals-hint').addEventListener('click', () => {
+  chrome.runtime.sendMessage({ action: 'openExtensionDetails' });
+  window.close();
+});
+
 // Get current state and update UI
 async function updateUI() {
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -36,6 +109,7 @@ async function updateUI() {
   });
 
   updateServerStatus(response?.ports);
+  renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts });
 }
 
 // Create ripple effect on click

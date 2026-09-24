@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chrome Extension (Manifest V3) that toggles development mode for on24.com domains by managing a cookie (`htm-dev-mode`) plus user-configurable **Map Local** and **Rewrite** rules, implemented Charles-style with `chrome.debugger` (Fetch domain): the page keeps its real URL/origin, only the response body (map local) or the outgoing URL (rewrite) is changed. No proxy is used.
+Chrome Extension (Manifest V3) that toggles development mode for on24.com domains by managing a cookie (`htm-dev-mode`) plus user-configurable **Map Local** and **Rewrite** rules, implemented Charles-style with `chrome.debugger` (Fetch domain): the page keeps its real URL/origin, only the response body (map local) or the outgoing URL (rewrite) is changed. No proxy is used. Independently of the mode, per-domain **Globals** (e.g. `window.isNurturePage = true`) can be injected before any page JS runs via `chrome.userScripts`.
 
 ## Development
 
@@ -32,6 +32,7 @@ npm run serve                # or run it manually in a terminal
 - **Interception:** tabs whose URL's domain is in DEV/PREVIEW get `chrome.debugger.attach` + `Fetch.enable` (`attachTab`/`detachTab`/`syncTab`/`syncAllTabs`). Patterns = the raw map-local globs, or `*` when any rewrite rule applies to the state. On `Fetch.requestPaused` the mode is the **tab's** (`tabStates`, set by `enableInterception`), not the request host's — assets are served from CDNs such as `orionqa.akamaized.net`. Then: apply rewrites (`applyRewrites`, JS `String.replace` with `$n`) → first matching map-local rule (`mapLocalTarget`, `globToRegex`) → fetch `/m/<id>/<path>` from the local server → `Fetch.fulfillRequest` (200, server Content-Type, base64 body) or, if missing/server down, `Fetch.continueRequest` (with `url` when a rewrite changed it). Every paused request is answered exactly once.
 - Attach triggers: `setState`, `webNavigation.onBeforeNavigate`, `tabs.onUpdated` (url), `storage.onChanged`, `init()` (re-attaches all open tabs after a worker restart). Navigation-triggered attaches pass `reloadAfter: true`: when they perform a *new* attach the document request was already in flight un-intercepted, so the tab is reloaded once (in-flight attaches are deduplicated per tab in `attaching`). `onDetach` with `canceled_by_user` (user clicked Cancel on the debugging bar) marks the tab as user-detached until its next top-level navigation. A 20 s `getPlatformInfo` keep-alive runs while any tab is attached. Debugger sessions outlive the worker, so `attachedTabs` is rebuilt from `chrome.debugger.getTargets()` on startup (`ensureReady`), `detachTab` always calls `chrome.debugger.detach`, and `attachTab` re-attaches when a remembered session no longer answers.
 - `syncRules()` keeps a single kind of `declarativeNetRequest` dynamic rule: no-cache request headers per active domain
+- **Globals (independent of the mode, works in OFF too):** `chrome.storage.local.globals` = `{ '.on24.com': [{ name, value }] }` (value = raw string). `syncGlobals()` (queued via `scheduleGlobalsSync`, run at `init()` and on `storage.onChanged`) unregisters all user scripts and registers one per domain: `id: 'globals:<domain>'`, `matches: ['*://*.<d>/*', '*://<d>/*']`, inline `js: [{ code }]` from `buildGlobalsCode`, `world: 'MAIN'`, `runAt: 'document_start'`, `allFrames: true` (no other properties: `chrome.userScripts.register` rejects unknown keys such as `matchOriginAsFallback`, and the error only shows in the worker console). The code defines each variable as a locked accessor on `window` (getter returns the value, setter is a no-op) so it exists before any page script and survives page assignments. Values are `JSON.parse`d when possible (`true`, `42`, `{"a":1}`), otherwise kept as strings. Messages: `getState` also returns `{ domain, globals, userScripts }`; `setGlobals` saves the active tab domain's list, re-registers, and reloads the tab; `openExtensionDetails` opens `chrome://extensions/?id=…`. Requires the `userScripts` permission **and** the per-extension "Allow User Scripts" toggle (chrome://extensions → Dev Mode → Details, Chrome 138+); `userScriptsAvailable()` detects it and the popup shows a hint otherwise. Registrations persist across worker restarts and browser sessions.
 - Generates dynamic badge icons using OffscreenCanvas
 - Auto-reloads the tab when state changes
 
@@ -42,13 +43,14 @@ npm run serve                # or run it manually in a terminal
 
 **popup.html / popup.js** - Dropdown menu UI:
 - Styled dark theme dropdown with three options, gear button to settings
+- **Globals** section below the modes: list of `name = value` rows with × to delete, and a name/value form with + (Enter also adds). Editing saves via `setGlobals` and keeps the popup open while the tab reloads. Hidden on non-http(s) tabs; red hint when "Allow User Scripts" is off
 - Shows local server status when the active mode uses Map Local rules
 - Communicates with background.js via chrome.runtime.sendMessage
 
 **local-server/serve.js** - Static file server for Map Local (see above)
 
 **manifest.json** - Extension configuration (Manifest V3):
-- Permissions: `cookies`, `debugger`, `declarativeNetRequest`, `tabs`, `webNavigation`, `storage`
+- Permissions: `cookies`, `debugger`, `declarativeNetRequest`, `tabs`, `webNavigation`, `storage`, `userScripts`
 - Host permissions: `<all_urls>`
 
 ## Key Implementation Details
@@ -66,6 +68,11 @@ npm run serve                # or run it manually in a terminal
   mapLocal: [{ id, enabled, pattern: 'https://*/view/orion/*', localPath: '/Users/jnova/Projects/orion/static', modes: ['dev','preview'] }],
   rewrites: [{ id, enabled, regex: '/(.*)/dist/production-(css|js)-(.*).(css|js)(.*)', replacement: '/$1/dist/production-$2.$4', modes: ['preview'] }]
 }
+```
+
+**Globals model** (`chrome.storage.local.globals`, separate from `settings` so the options page never overwrites it):
+```js
+{ '.on24.com': [{ name: 'isNurturePage', value: 'true' }] }   // per root domain, same keys as domainStates
 ```
 
 **Request flow (Fetch domain):** Rewrite runs before Map Local, so in PREVIEW `…/dist/production-js-<hash>.js` → `…/dist/production-js.js` → local `static/labs/dist/production-js.js`, while the page still sees the hashed URL. HTML documents and iframes are mapped the same way as assets (no origin change, cookies and same-origin API calls keep working).

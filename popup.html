@@ -35,7 +35,7 @@
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      min-width: 200px;
+      min-width: 270px;
       background: var(--bg);
       padding: 6px;
     }
@@ -248,6 +248,96 @@
     @media (prefers-color-scheme: dark) {
       .server-status.down { color: #ef9a9a; }
     }
+
+    /* Global variable overrides (per domain, any mode) */
+    .globals {
+      margin-top: 4px;
+      padding: 6px 6px 2px 12px;
+      border-top: 1px solid var(--border);
+    }
+
+    .globals[hidden] { display: none; }
+
+    .globals .title {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+
+    .globals .row {
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) auto minmax(0, 2fr) 26px;
+      align-items: center;
+      gap: 4px;
+      min-height: 26px;
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 12px;
+      color: var(--text);
+    }
+
+    .globals .row .eq { color: var(--text-secondary); }
+
+    .globals .row .name,
+    .globals .row .value {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 0 2px;
+    }
+
+    .globals .row .value { color: #1a73e8; }
+    @media (prefers-color-scheme: dark) { .globals .row .value { color: #8ab4f8; } }
+
+    .globals input {
+      font: 12px ui-monospace, Menlo, monospace;
+      color: var(--text);
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 3px 5px;
+      width: 100%;
+      min-width: 0;
+      outline: none;
+    }
+
+    .globals input:focus { border-color: #1a73e8; }
+    .globals input::placeholder { color: var(--text-secondary); opacity: 0.7; }
+
+    .globals .btn {
+      width: 26px;
+      height: 26px;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    .globals .btn:hover { background: var(--bg-hover); color: var(--text); }
+    .globals .btn.remove:hover { color: #D32F2F; }
+    .globals .btn.add:hover { color: #00a344; }
+
+    .globals .hint {
+      display: none;
+      margin: 2px 0 6px;
+      font-size: 11px;
+      color: #c62828;
+      cursor: pointer;
+    }
+
+    .globals.unsupported .hint { display: block; }
+    .globals .hint:hover { text-decoration: underline; }
+
+    @media (prefers-color-scheme: dark) {
+      .globals .hint { color: #ef9a9a; }
+    }
   </style>
 </head>
 <body>
@@ -276,6 +366,17 @@
       <span class="label">Preview</span>
       <span class="badge">PRE</span>
     </div>
+  </div>
+  <div class="globals" id="globals" hidden>
+    <span class="title">Globals</span>
+    <span class="hint" id="globals-hint" title="Open extension details">Enable “Allow User Scripts” in extension details</span>
+    <div id="globals-list"></div>
+    <form class="row" id="globals-add" autocomplete="off">
+      <input type="text" id="globals-name" placeholder="isFlagEnabled" spellcheck="false">
+      <span class="eq">=</span>
+      <input type="text" id="globals-value" placeholder="true" title='Booleans, numbers and JSON are parsed (true, 42, {"a":1}); anything else is a string' spellcheck="false">
+      <button type="submit" class="btn add" title="Add variable">+</button>
+    </form>
   </div>
   <div class="server-status" id="server-status" hidden title="Open settings">
     <span class="dot"></span>
