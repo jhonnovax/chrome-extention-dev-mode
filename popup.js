@@ -34,21 +34,30 @@ const globalsName = document.getElementById('globals-name');
 const globalsValue = document.getElementById('globals-value');
 
 let globals = [];
+let globalsMeta = { domain: null, userScripts: true, state: 'off' };
 
-function renderGlobals(list, { domain, userScripts } = {}) {
+function renderGlobals(list, meta = {}) {
   globals = Array.isArray(list) ? list : [];
+  globalsMeta = { ...globalsMeta, ...meta };
+  const { domain, userScripts, state } = globalsMeta;
+  const disabled = state === 'off';
+
   globalsEl.hidden = !domain;
   globalsEl.classList.toggle('unsupported', userScripts === false);
+  globalsEl.classList.toggle('disabled', disabled);
+  globalsName.disabled = disabled;
+  globalsValue.disabled = disabled;
+  globalsForm.querySelector('.btn.add').disabled = disabled;
   globalsList.textContent = '';
 
   for (const entry of globals) {
-    const row = document.createElement('div');
-    row.className = 'row';
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.title = `${entry.name} = ${entry.value}`;
 
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = entry.name;
-    name.title = entry.name;
 
     const eq = document.createElement('span');
     eq.className = 'eq';
@@ -57,28 +66,29 @@ function renderGlobals(list, { domain, userScripts } = {}) {
     const value = document.createElement('span');
     value.className = 'value';
     value.textContent = entry.value;
-    value.title = entry.value;
 
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'btn remove';
     remove.title = 'Remove variable';
     remove.textContent = '×';
+    remove.disabled = disabled;
     remove.addEventListener('click', () => saveGlobals(globals.filter(e => e !== entry)));
 
-    row.append(name, eq, value, remove);
-    globalsList.appendChild(row);
+    chip.append(name, eq, value, remove);
+    globalsList.appendChild(chip);
   }
 }
 
 // Background stores the list, re-registers the user script and reloads the tab
 async function saveGlobals(list) {
   const response = await chrome.runtime.sendMessage({ action: 'setGlobals', globals: list });
-  if (response?.success) renderGlobals(response.globals, { domain: true, userScripts: !globalsEl.classList.contains('unsupported') });
+  if (response?.success) renderGlobals(response.globals);
 }
 
 globalsForm.addEventListener('submit', (event) => {
   event.preventDefault();
+  if (globalsMeta.state === 'off') return;
   const name = globalsName.value.trim().replace(/^(window|self|globalThis)\./, '');
   if (!name) {
     globalsName.focus();
@@ -109,7 +119,7 @@ async function updateUI() {
   });
 
   updateServerStatus(response?.ports);
-  renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts });
+  renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts, state: currentState });
 }
 
 // Create ripple effect on click

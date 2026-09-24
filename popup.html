@@ -249,25 +249,91 @@
       .server-status.down { color: #ef9a9a; }
     }
 
-    /* Global variable overrides (per domain, any mode) */
+    /* Global variable overrides (per domain, injected in DEV/PREVIEW) */
     .globals {
       margin-top: 4px;
-      padding: 6px 6px 2px 12px;
+      padding: 6px 6px 4px 12px;
       border-top: 1px solid var(--border);
+      transition: opacity 0.15s ease;
     }
 
     .globals[hidden] { display: none; }
 
+    .globals .head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
     .globals .title {
-      display: block;
       font-size: 11px;
       font-weight: 600;
       letter-spacing: 0.4px;
       text-transform: uppercase;
       color: var(--text-secondary);
-      margin-bottom: 4px;
     }
 
+    .globals .status {
+      display: none;
+      font-size: 10px;
+      font-weight: 500;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: rgba(158, 158, 158, 0.15);
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    /* Saved variables: inline chips `name = value` */
+    .globals .list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-bottom: 6px;
+    }
+
+    .globals .list:empty { display: none; }
+
+    .globals .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      max-width: 100%;
+      padding: 2px 2px 2px 7px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg-hover);
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 11.5px;
+      line-height: 16px;
+      color: var(--text);
+      transition: border-color 0.15s ease;
+    }
+
+    .globals .chip:hover { border-color: var(--text-secondary); }
+
+    .globals .chip .name,
+    .globals .chip .value {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .globals .chip .name { max-width: 130px; }
+    .globals .chip .value { max-width: 90px; color: #1a73e8; }
+    .globals .chip .eq { color: var(--text-secondary); }
+    @media (prefers-color-scheme: dark) { .globals .chip .value { color: #8ab4f8; } }
+
+    .globals .chip .btn {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      font-size: 13px;
+    }
+
+    /* Add form */
     .globals .row {
       display: grid;
       grid-template-columns: minmax(0, 3fr) auto minmax(0, 2fr) 26px;
@@ -280,17 +346,6 @@
     }
 
     .globals .row .eq { color: var(--text-secondary); }
-
-    .globals .row .name,
-    .globals .row .value {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      padding: 0 2px;
-    }
-
-    .globals .row .value { color: #1a73e8; }
-    @media (prefers-color-scheme: dark) { .globals .row .value { color: #8ab4f8; } }
 
     .globals input {
       font: 12px ui-monospace, Menlo, monospace;
@@ -308,6 +363,9 @@
     .globals input::placeholder { color: var(--text-secondary); opacity: 0.7; }
 
     .globals .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       width: 26px;
       height: 26px;
       border: none;
@@ -320,7 +378,7 @@
       transition: background 0.15s ease, color 0.15s ease;
     }
 
-    .globals .btn:hover { background: var(--bg-hover); color: var(--text); }
+    .globals .btn:hover { background: var(--bg-active); color: var(--text); }
     .globals .btn.remove:hover { color: #D32F2F; }
     .globals .btn.add:hover { color: #00a344; }
 
@@ -338,6 +396,19 @@
     @media (prefers-color-scheme: dark) {
       .globals .hint { color: #ef9a9a; }
     }
+
+    /* OFF: variables are kept but not injected, so the whole section is grayed out */
+    .globals.disabled .status { display: inline-block; }
+    .globals.disabled .list,
+    .globals.disabled .row { opacity: 0.45; }
+    .globals.disabled .chip { background: transparent; }
+    .globals.disabled .chip:hover { border-color: var(--border); }
+    .globals.disabled .chip .value { color: var(--text-secondary); }
+    .globals.disabled input { cursor: not-allowed; }
+    .globals.disabled .btn { cursor: not-allowed; pointer-events: none; }
+    .globals.disabled .chip .btn { visibility: hidden; }
+    .globals.disabled .row { pointer-events: none; }
+
   </style>
 </head>
 <body>
@@ -368,9 +439,12 @@
     </div>
   </div>
   <div class="globals" id="globals" hidden>
-    <span class="title">Globals</span>
+    <div class="head">
+      <span class="title">Globals</span>
+      <span class="status" title="Switch to Development or Preview to inject these variables">Not injected while Off</span>
+    </div>
     <span class="hint" id="globals-hint" title="Open extension details">Enable “Allow User Scripts” in extension details</span>
-    <div id="globals-list"></div>
+    <div class="list" id="globals-list"></div>
     <form class="row" id="globals-add" autocomplete="off">
       <input type="text" id="globals-name" placeholder="isFlagEnabled" spellcheck="false">
       <span class="eq">=</span>

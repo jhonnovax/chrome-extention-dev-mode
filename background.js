@@ -127,7 +127,7 @@ async function getSettings() {
   return seeded;
 }
 
-// ---- Global variable overrides (per root domain, any mode) ----
+// ---- Global variable overrides (per root domain, injected in DEV/PREVIEW only) ----
 // Stored as { '.on24.com': [{ name, value }] } with `value` the raw string typed in the popup
 
 async function getGlobals(domain) {
@@ -551,7 +551,7 @@ function scheduleSync() {
 }
 
 // ---- userScripts: one MAIN-world document_start script per domain with global overrides ----
-// Independent of the debugger/Fetch path: works in every mode, including OFF.
+// Independent of the debugger/Fetch path: injected in DEV and PREVIEW, paused (kept but not registered) in OFF.
 
 let warnedUserScripts = false;
 
@@ -565,11 +565,17 @@ async function syncGlobals() {
   }
   warnedUserScripts = false;
 
-  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
+  const { [GLOBALS_KEY]: all = {}, [STORAGE_KEY]: states = {} } = await chrome.storage.local.get([GLOBALS_KEY, STORAGE_KEY]);
   const scripts = [];
+  const paused = [];
   for (const [rawDomain, list] of Object.entries(all)) {
     const domain = rawDomain.replace(/^\./, '');
     if (!domain || !Array.isArray(list) || !list.length) continue;
+    // Variables are kept but not injected while the domain is OFF
+    if (normalizeState(states[rawDomain]) === STATES.OFF) {
+      paused.push(domain);
+      continue;
+    }
     scripts.push({
       id: `globals:${domain}`,
       matches: [`*://*.${domain}/*`, `*://${domain}/*`],
@@ -589,7 +595,8 @@ async function syncGlobals() {
       throw err;
     }
   }
-  console.info(`[Dev Mode] global overrides registered for: ${scripts.map(s => s.id.slice(8)).join(', ') || 'none'}`);
+  console.info(`[Dev Mode] global overrides registered for: ${scripts.map(s => s.id.slice(8)).join(', ') || 'none'}`
+    + (paused.length ? ` (paused while OFF: ${paused.join(', ')})` : ''));
 }
 
 let globalsQueue = Promise.resolve();
@@ -658,6 +665,7 @@ async function setState(newState) {
     console.info(`[Dev Mode] setState ${domain} → ${normalizedState} (tab ${tab.id})`);
     await saveState(domain, normalizedState);
     await scheduleSync();
+    await scheduleGlobalsSync();
     await applyConfig(normalizedState, tab.url);
     userDetachedTabs.delete(tab.id);
     await ensureReady();
@@ -717,7 +725,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
     ensureReady().then(syncAllTabs);
   }
   if (changes[SETTINGS_KEY]) pushServerConfig();
-  if (changes[GLOBALS_KEY]) scheduleGlobalsSync();
+  // Globals depend on the domain state too (not injected while OFF)
+  if (changes[GLOBALS_KEY] || changes[STORAGE_KEY]) scheduleGlobalsSync();
 });
 
 // Apply cookie at multiple points to ensure it's set before request goes out
