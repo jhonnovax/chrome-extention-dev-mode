@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chrome Extension (Manifest V3) that toggles development mode for on24.com domains by managing a cookie (`htm-dev-mode`) plus user-configurable **Map Local** and **Rewrite** rules, implemented Charles-style with `chrome.debugger` (Fetch domain): the page keeps its real URL/origin, only the response body (map local) or the outgoing URL (rewrite) is changed. No proxy is used. Independently of the mode, per-domain **Globals** (e.g. `window.isNurturePage = true`) can be injected before any page JS runs via `chrome.userScripts`.
 
+**Future direction (design only, not implemented):** [docs/all-browsers-proxy-engine.md](docs/all-browsers-proxy-engine.md) describes replacing the extension with a local MITM proxy in `local-server/` so DEV/PREVIEW, Map Local, rewrites and globals work in every browser (Chrome family, Firefox, Safari).
+
 ## Development
 
 No build step required. This is a plain JavaScript extension.
