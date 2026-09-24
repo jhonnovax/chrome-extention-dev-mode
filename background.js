@@ -242,11 +242,11 @@ function sendCommand(tabId, method, params) {
 // Fetch.enable patterns for a state: raw globs of map-local rules; '*' when any rewrite applies
 async function interceptPatterns(state) {
   const settings = await getSettings();
-  const patterns = enabledFor(settings.mapLocal, state)
+  let patterns = enabledFor(settings.mapLocal, state)
     .filter(e => e.pattern)
     .map(e => ({ urlPattern: e.pattern, requestStage: 'Request' }));
   if (enabledFor(settings.rewrites, state).some(e => e.regex)) {
-    return [{ urlPattern: '*', requestStage: 'Request' }];
+    patterns = [{ urlPattern: '*', requestStage: 'Request' }];
   }
   return patterns;
 }
@@ -258,47 +258,105 @@ async function enableInterception(tabId, state) {
     return;
   }
   await sendCommand(tabId, 'Fetch.enable', { patterns });
+  console.info(`[Dev Mode] interception on tab ${tabId} (${state}):`, patterns.map(p => p.urlPattern).join(', '));
 }
 
-async function attachTab(tabId, state) {
+const attaching = new Map(); // tabId -> in-flight attach promise
+
+// Attach + enable interception. `reloadAfter`: the call comes from a navigation whose document
+// request may already be in flight, so reload once when this call performed a new attach.
+async function attachTab(tabId, state, { reloadAfter = false } = {}) {
   if (attachedTabs.has(tabId)) {
-    await enableInterception(tabId, state).catch(() => {});
-    return;
+    try {
+      await enableInterception(tabId, state);
+      return;
+    } catch {
+      // Session is gone (worker restart, DevTools took over…) — attach again below
+      attachedTabs.delete(tabId);
+    }
   }
   if (userDetachedTabs.has(tabId)) return;
+  if (attaching.has(tabId)) return attaching.get(tabId);
+
+  const job = (async () => {
+    try {
+      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      console.info(`[Dev Mode] attached tab ${tabId} (${state})`);
+    } catch (err) {
+      // Already attached by us in a previous worker life, or not attachable (chrome://, another debugger)
+      if (!/already attached/i.test(err?.message || '')) {
+        console.warn(`[Dev Mode] cannot attach tab ${tabId}: ${err?.message}`);
+        return;
+      }
+      console.info(`[Dev Mode] tab ${tabId} already attached, reusing session`);
+    }
+    attachedTabs.add(tabId);
+    updateKeepAlive();
+    try {
+      await enableInterception(tabId, state);
+    } catch (err) {
+      console.warn(`[Dev Mode] Fetch.enable failed on tab ${tabId}: ${err?.message}`);
+      attachedTabs.delete(tabId);
+      updateKeepAlive();
+      return;
+    }
+    if (reloadAfter) {
+      console.info(`[Dev Mode] reloading tab ${tabId} so the document is intercepted`);
+      // Plain reload: a cache-bypassing reload makes some on24 pages answer 404
+      chrome.tabs.reload(tabId).catch(() => {});
+    }
+  })();
+
+  attaching.set(tabId, job);
   try {
-    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-  } catch (err) {
-    // Already attached by us in a previous worker life, or not attachable (chrome://, another debugger)
-    if (!/already attached/i.test(err?.message || '')) return;
-  }
-  attachedTabs.add(tabId);
-  updateKeepAlive();
-  try {
-    await enableInterception(tabId, state);
-  } catch (err) {
-    console.warn('[Dev Mode] Fetch.enable failed', err);
+    await job;
+  } finally {
+    attaching.delete(tabId);
   }
 }
 
+// Always ask Chrome to detach: the in-memory set is lost when the service worker restarts,
+// but the debugger session is not, so it must not be the only source of truth
 async function detachTab(tabId) {
-  if (!attachedTabs.has(tabId)) return;
-  attachedTabs.delete(tabId);
+  const known = attachedTabs.delete(tabId);
   updateKeepAlive();
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  try {
+    await chrome.debugger.detach({ tabId });
+    console.info(`[Dev Mode] detached tab ${tabId}`);
+  } catch (err) {
+    if (known) console.warn(`[Dev Mode] detach tab ${tabId} failed: ${err?.message}`);
+  }
+}
+
+// Rebuild the attached set from Chrome after a worker (re)start
+async function loadAttachedTabs() {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    for (const t of targets) {
+      if (t.attached && t.tabId != null) attachedTabs.add(t.tabId);
+    }
+  } catch { /* ignore */ }
+  updateKeepAlive();
 }
 
 // Attach or detach a tab according to the state of its current URL
-async function syncTab(tabId, url) {
+async function syncTab(tabId, url, options) {
   const state = await stateForUrl(url);
   if (state === STATES.OFF) await detachTab(tabId);
-  else await attachTab(tabId, state);
+  else await attachTab(tabId, state, options);
 }
 
 // Re-evaluate every open tab (worker start, settings change)
 async function syncAllTabs() {
   const tabs = await chrome.tabs.query({});
   await Promise.all(tabs.map(tab => syncTab(tab.id, tab.url)));
+}
+
+// Worker startup: learn what Chrome still has attached, then reconcile every tab
+let ready = null;
+function ensureReady() {
+  if (!ready) ready = loadAttachedTabs().then(syncAllTabs).catch(() => {});
+  return ready;
 }
 
 function toBase64(buffer) {
@@ -316,12 +374,23 @@ async function onRequestPaused(tabId, params) {
   const finish = (method, extra = {}) =>
     sendCommand(tabId, method, { requestId, ...extra }).catch(() => {});
 
+  // Events can arrive right after a worker restart, before the attached set is rebuilt
+  attachedTabs.add(tabId);
+  updateKeepAlive();
+
+  // Only request-stage events are subscribed; be safe if a response-stage one ever arrives
+  if (params.responseStatusCode !== undefined || params.responseErrorReason) {
+    return finish('Fetch.continueResponse');
+  }
+
   try {
     const [state, settings] = await Promise.all([stateForUrl(request.url), getSettings()]);
     if (state === STATES.OFF) return finish('Fetch.continueRequest');
 
     const rewritten = applyRewrites(request.url, settings, state);
     const local = mapLocalTarget(rewritten, settings, state);
+    const isDocument = params.resourceType === 'Document';
+    if (isDocument) console.info(`[Dev Mode] document ${request.url} (${state}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
 
     if (local) {
       let res = null;
@@ -346,7 +415,7 @@ async function onRequestPaused(tabId, params) {
         }
         return finish('Fetch.fulfillRequest', { responseCode: 200, responseHeaders, body });
       }
-      if (res && !warnedUrls.has(rewritten)) {
+      if (res && (isDocument || !warnedUrls.has(rewritten))) {
         warnedUrls.add(rewritten);
         console.warn(`[Dev Mode] No local file for ${rewritten} (${res.status}); serving from the real site.`);
       }
@@ -366,6 +435,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId == null) return;
+  console.info(`[Dev Mode] Chrome detached tab ${source.tabId}: ${reason}`);
   attachedTabs.delete(source.tabId);
   updateKeepAlive();
   // User clicked "Cancel" on the debugging bar: leave the tab alone until it navigates again
@@ -444,13 +514,15 @@ async function setState(newState) {
   const domain = extractDomain(tab.url);
 
   if (domain) {
+    console.info(`[Dev Mode] setState ${domain} → ${normalizedState} (tab ${tab.id})`);
     await saveState(domain, normalizedState);
     await scheduleSync();
     await applyConfig(normalizedState, tab.url);
     userDetachedTabs.delete(tab.id);
+    await ensureReady();
     await syncAllTabs();
     updateIcon(normalizedState);
-    chrome.tabs.reload(tab.id, { bypassCache: true });
+    chrome.tabs.reload(tab.id);
   }
 }
 
@@ -487,7 +559,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes[STORAGE_KEY] || changes[SETTINGS_KEY]) {
     scheduleSync();
-    syncAllTabs();
+    ensureReady().then(syncAllTabs);
   }
   if (changes[SETTINGS_KEY]) pushServerConfig();
 });
@@ -502,7 +574,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
 
   // A fresh top-level navigation ends a user-cancelled debugging session's grace period
   userDetachedTabs.delete(details.tabId);
-  syncTab(details.tabId, details.url);
+  ensureReady().then(() => syncTab(details.tabId, details.url, { reloadAfter: true }));
 
   const state = await getState(domain);
   await applyConfig(state, details.url);
@@ -522,7 +594,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!domain) return;
 
   const state = await getState(domain);
-  await syncTab(tabId, changeInfo.url);
+  await ensureReady();
+  await syncTab(tabId, changeInfo.url, { reloadAfter: true });
   await applyConfig(state, changeInfo.url);
 
   if (tab.active) updateIcon(state);
@@ -555,7 +628,7 @@ function init() {
   updateIconForActiveTab();
   scheduleSync();
   pushServerConfig();
-  syncAllTabs();
+  ensureReady();
 }
 chrome.runtime.onInstalled.addListener(init);
 chrome.runtime.onStartup.addListener(init);
