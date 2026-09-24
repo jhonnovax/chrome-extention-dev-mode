@@ -1,21 +1,43 @@
 // Constants
 const COOKIE_NAME = 'htm-dev-mode';
 const COOKIE_VALUE = '4815162342';
-const CACHE_RULE_ID = 1;
 const STORAGE_KEY = 'domainStates';
-const PROXY_HOST = '127.0.0.1';
-const PROXY_PORT = 8888;
+const SETTINGS_KEY = 'settings';
+const LOCAL_HOST = '127.0.0.1';
+const LOCAL_PORT = 4815;
+const LOCAL_ORIGIN = `http://${LOCAL_HOST}:${LOCAL_PORT}`;
 
-const PROXY_MODES = { SYSTEM: 'system', FIXED: 'fixed', DIRECT: 'direct' };
-const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview', PROD: 'prod' };
+const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview' };
 
 // badge*: exact popup badge CSS colors (light / dark variants)
 const STATE_CONFIG = {
-  [STATES.OFF]:     { color: '#94A3B8', label: 'OFF', badgeBgLight: 'rgba(158,158,158,0.15)', badgeTextLight: '#5f6368', badgeBgDark: 'rgba(158,158,158,0.20)', badgeTextDark: '#bdbdbd', title: 'Off',              cookie: false, proxy: PROXY_MODES.SYSTEM, cache: true },
-  [STATES.DEV]:     { color: '#22C55E', label: 'DEV', badgeBgLight: 'rgba(0,200,83,0.15)',    badgeTextLight: '#00a344', badgeBgDark: 'rgba(0,200,83,0.20)',    badgeTextDark: '#69f0ae', title: 'Development Mode', cookie: true,  proxy: PROXY_MODES.FIXED,  cache: false },
-  [STATES.PREVIEW]: { color: '#EAB308', label: 'PRE', badgeBgLight: 'rgba(234,179,8,0.18)',   badgeTextLight: '#a16207', badgeBgDark: 'rgba(234,179,8,0.24)',   badgeTextDark: '#facc15', title: 'Preview Mode',     cookie: false, proxy: PROXY_MODES.FIXED,  cache: false },
-  [STATES.PROD]:    { color: '#EF4444', label: 'PRO', badgeBgLight: 'rgba(211,47,47,0.15)',   badgeTextLight: '#c62828', badgeBgDark: 'rgba(211,47,47,0.20)',   badgeTextDark: '#ef9a9a', title: 'Production Mode',  cookie: false, proxy: PROXY_MODES.DIRECT, cache: false }
+  [STATES.OFF]:     { color: '#94A3B8', label: 'OFF', badgeBgLight: 'rgba(158,158,158,0.15)', badgeTextLight: '#5f6368', badgeBgDark: 'rgba(158,158,158,0.20)', badgeTextDark: '#bdbdbd', title: 'Off',              cookie: false, cache: true },
+  [STATES.DEV]:     { color: '#22C55E', label: 'DEV', badgeBgLight: 'rgba(0,200,83,0.15)',    badgeTextLight: '#00a344', badgeBgDark: 'rgba(0,200,83,0.20)',    badgeTextDark: '#69f0ae', title: 'Development Mode', cookie: true,  cache: false },
+  [STATES.PREVIEW]: { color: '#EAB308', label: 'PRE', badgeBgLight: 'rgba(234,179,8,0.18)',   badgeTextLight: '#a16207', badgeBgDark: 'rgba(234,179,8,0.24)',   badgeTextDark: '#facc15', title: 'Preview Mode',     cookie: false, cache: false }
 };
+
+// Default map-local / rewrite rules seeded on first run (editable in options.html)
+const DEFAULT_SETTINGS = {
+  mapLocal: [{
+    id: 'ml-orion',
+    enabled: true,
+    pattern: 'https://*/view/orion/*',
+    localPath: '/Users/jnova/Projects/orion/static',
+    modes: [STATES.DEV, STATES.PREVIEW]
+  }],
+  rewrites: [{
+    id: 'rw-production-hash',
+    enabled: true,
+    regex: '/(.*)/dist/production-(css|js)-(.*).(css|js)(.*)',
+    replacement: '/$1/dist/production-$2.$4',
+    modes: [STATES.PREVIEW]
+  }]
+};
+
+const ALL_RESOURCE_TYPES = [
+  'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font', 'object',
+  'xmlhttprequest', 'ping', 'media', 'websocket', 'other'
+];
 
 function normalizeState(state) {
   return STATE_CONFIG[state] ? state : STATES.OFF;
@@ -94,6 +116,15 @@ async function saveState(domain, state) {
   await chrome.storage.local.set({ [STORAGE_KEY]: states });
 }
 
+// Get settings, seeding defaults when missing (first install or upgrade)
+async function getSettings() {
+  const { [SETTINGS_KEY]: settings } = await chrome.storage.local.get(SETTINGS_KEY);
+  if (settings && Array.isArray(settings.mapLocal) && Array.isArray(settings.rewrites)) return settings;
+  const seeded = structuredClone(DEFAULT_SETTINGS);
+  await chrome.storage.local.set({ [SETTINGS_KEY]: seeded });
+  return seeded;
+}
+
 // Update extension icon
 function updateIcon(state) {
   const { title } = STATE_CONFIG[state];
@@ -101,53 +132,105 @@ function updateIcon(state) {
   chrome.action.setTitle({ title });
 }
 
-// Apply state configuration (cookie, proxy, cache)
+// Apply state configuration (cookie). Network rules are handled by syncRules().
 async function applyConfig(state, url) {
-  const normalizedState = normalizeState(state);
-  const config = STATE_CONFIG[normalizedState];
+  const config = STATE_CONFIG[normalizeState(state)];
   const domain = url ? extractDomain(url) : null;
+  if (!domain) return;
 
-  // Cookie
-  if (domain) {
-    if (config.cookie) {
-      await chrome.cookies.set({
-        url, domain,
-        name: COOKIE_NAME,
-        value: COOKIE_VALUE,
-        path: '/',
-        secure: true,
-        sameSite: 'no_restriction',
-        expirationDate: Math.floor(Date.now() / 1000) + 31536000
-      });
-    } else {
-      await chrome.cookies.remove({ url, name: COOKIE_NAME }).catch(() => {});
-    }
-  }
-
-  // Proxy
-  if (config.proxy === PROXY_MODES.FIXED) {
-    await chrome.proxy.settings.set({
-      value: {
-        mode: 'fixed_servers',
-        rules: { singleProxy: { host: PROXY_HOST, port: PROXY_PORT } }
-      },
-      scope: 'regular'
+  if (config.cookie) {
+    await chrome.cookies.set({
+      url, domain,
+      name: COOKIE_NAME,
+      value: COOKIE_VALUE,
+      path: '/',
+      secure: true,
+      sameSite: 'no_restriction',
+      expirationDate: Math.floor(Date.now() / 1000) + 31536000
     });
-  } else if (config.proxy === PROXY_MODES.DIRECT) {
-    await chrome.proxy.settings.set({ value: { mode: 'direct' }, scope: 'regular' });
   } else {
-    // Condition OFF - Clear proxy settings
-    await chrome.proxy.settings.clear({ scope: 'regular' });
+    await chrome.cookies.remove({ url, name: COOKIE_NAME }).catch(() => {});
   }
+}
 
-  // Cache
-  if (config.cache) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [CACHE_RULE_ID] });
-  } else {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [CACHE_RULE_ID],
-      addRules: [{
-        id: CACHE_RULE_ID,
+// ---- declarativeNetRequest rule building ----
+
+function escapeRegex(str) {
+  return str.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Glob pattern ("https://*/view/orion/*") -> anchored RE2 regex, each * is a capture group
+function globToRegex(pattern) {
+  const regex = pattern.split('*').map(escapeRegex).join('(.*)');
+  return { regex: `^${regex}$`, groups: pattern.split('*').length - 1 };
+}
+
+// "$1" style replacement -> DNR regexSubstitution ("\1")
+function toSubstitution(replacement) {
+  return replacement.replace(/\$(\d+)/g, '\\$1');
+}
+
+// Each rule is a "mount" on the local server: /m/<ruleId>/<last wildcard>
+function mapLocalTarget(entry) {
+  const { groups } = globToRegex(entry.pattern);
+  return `${LOCAL_ORIGIN}/m/${entry.id}/` + (groups ? `\\${groups}` : '');
+}
+
+// Tell the local server which folders to serve (all enabled map-local rules, any mode)
+async function pushServerConfig() {
+  const settings = await getSettings();
+  const mounts = {};
+  for (const e of settings.mapLocal) {
+    if (e.enabled !== false && e.id && e.localPath) mounts[e.id] = e.localPath;
+  }
+  try {
+    await fetch(`${LOCAL_ORIGIN}/__config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mounts })
+    });
+  } catch {
+    // server not running; it will get the config on the next save / startup
+  }
+}
+
+// Same rule body twice: once scoped to requests made by the page (sub-resources),
+// once scoped to requests going to the domain itself (direct navigations)
+function scopedRules(domain, base) {
+  return [
+    { ...base, condition: { ...base.condition, initiatorDomains: [domain] } },
+    { ...base, condition: { ...base.condition, requestDomains: [domain] } }
+  ];
+}
+
+async function regexOk(regex) {
+  try {
+    const result = await chrome.declarativeNetRequest.isRegexSupported({ regex, isCaseSensitive: false });
+    return result.isSupported;
+  } catch {
+    return false;
+  }
+}
+
+// Rebuild the complete dynamic rule set from stored domain states + settings
+async function syncRules() {
+  const [{ [STORAGE_KEY]: states = {} }, settings] = await Promise.all([
+    chrome.storage.local.get(STORAGE_KEY),
+    getSettings()
+  ]);
+
+  const rules = [];
+  let usesLocalServer = false;
+  const enabled = (list) => list.filter(e => e.enabled !== false);
+
+  for (const [rawDomain, rawState] of Object.entries(states)) {
+    const state = normalizeState(rawState);
+    const config = STATE_CONFIG[state];
+    const domain = rawDomain.replace(/^\./, '');
+    if (state === STATES.OFF || !domain) continue;
+
+    if (!config.cache) {
+      rules.push({
         priority: 1,
         action: {
           type: 'modifyHeaders',
@@ -156,13 +239,95 @@ async function applyConfig(state, url) {
             { header: 'Pragma', operation: 'set', value: 'no-cache' }
           ]
         },
-        condition: {
-          urlFilter: '*',
-          resourceTypes: ['main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font', 'xmlhttprequest', 'other']
-        }
-      }]
+        condition: { requestDomains: [domain], resourceTypes: ALL_RESOURCE_TYPES }
+      });
+    }
+
+    for (const entry of enabled(settings.rewrites)) {
+      if (!entry.modes?.includes(state) || !entry.regex) continue;
+      if (!(await regexOk(entry.regex))) {
+        console.warn('[Dev Mode] Unsupported rewrite regex skipped:', entry.regex);
+        continue;
+      }
+      rules.push(...scopedRules(domain, {
+        priority: 3,
+        action: { type: 'redirect', redirect: { regexSubstitution: toSubstitution(entry.replacement || '') } },
+        condition: { regexFilter: entry.regex, isUrlFilterCaseSensitive: false, resourceTypes: ALL_RESOURCE_TYPES }
+      }));
+    }
+
+    let hasMapLocal = false;
+    for (const entry of enabled(settings.mapLocal)) {
+      if (!entry.modes?.includes(state) || !entry.pattern || !entry.id) continue;
+      const { regex } = globToRegex(entry.pattern);
+      if (!(await regexOk(regex))) {
+        console.warn('[Dev Mode] Unsupported map-local pattern skipped:', entry.pattern);
+        continue;
+      }
+      hasMapLocal = true;
+      usesLocalServer = true;
+      rules.push(...scopedRules(domain, {
+        priority: 2,
+        action: { type: 'redirect', redirect: { regexSubstitution: mapLocalTarget(entry) } },
+        condition: { regexFilter: regex, isUrlFilterCaseSensitive: false, resourceTypes: ALL_RESOURCE_TYPES }
+      }));
+    }
+
+    // Pages loading mapped assets from 127.0.0.1 must not be blocked by the site's CSP
+    if (hasMapLocal) {
+      rules.push({
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [
+            { header: 'Content-Security-Policy', operation: 'remove' },
+            { header: 'Content-Security-Policy-Report-Only', operation: 'remove' }
+          ]
+        },
+        condition: { requestDomains: [domain], resourceTypes: ['main_frame', 'sub_frame'] }
+      });
+    }
+  }
+
+  // Local server responses: permissive CORS so fonts / fetch / crossorigin scripts work from any page
+  if (usesLocalServer) {
+    rules.push({
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'Access-Control-Allow-Origin', operation: 'set', value: '*' },
+          { header: 'Access-Control-Allow-Headers', operation: 'set', value: '*' },
+          { header: 'Access-Control-Allow-Methods', operation: 'set', value: 'GET, HEAD, OPTIONS' },
+          { header: 'Access-Control-Allow-Private-Network', operation: 'set', value: 'true' },
+          { header: 'Cross-Origin-Resource-Policy', operation: 'set', value: 'cross-origin' },
+          { header: 'Timing-Allow-Origin', operation: 'set', value: '*' }
+        ]
+      },
+      condition: { regexFilter: `^${escapeRegex(LOCAL_ORIGIN)}/`, resourceTypes: ALL_RESOURCE_TYPES }
     });
   }
+
+  rules.forEach((rule, i) => { rule.id = i + 1; });
+
+  const existing = await chrome.declarativeNetRequest.getDynamicRules();
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: existing.map(r => r.id),
+    addRules: rules
+  });
+}
+
+let syncQueue = Promise.resolve();
+function scheduleSync() {
+  syncQueue = syncQueue.then(syncRules).catch(err => console.error('[Dev Mode] syncRules failed', err));
+  return syncQueue;
+}
+
+// Ports the given state relies on: [LOCAL_PORT] when any map-local rule is active, else []
+async function localPortsForState(state) {
+  const settings = await getSettings();
+  const uses = settings.mapLocal.some(e => e.enabled !== false && e.modes?.includes(state) && e.pattern);
+  return uses ? [LOCAL_PORT] : [];
 }
 
 // Get active tab's state and update icon
@@ -192,34 +357,56 @@ async function setState(newState) {
 
   if (domain) {
     await saveState(domain, normalizedState);
+    await scheduleSync();
     await applyConfig(normalizedState, tab.url);
     updateIcon(normalizedState);
-    chrome.tabs.reload(tab.id);
+    chrome.tabs.reload(tab.id, { bypassCache: true });
   }
 }
 
 // Message handler
-chrome.runtime.onMessage.addListener((msg, _, respond) => {
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.action === 'setState') {
     setState(msg.state).then(() => respond({ success: true }));
     return true;
   }
   if (msg.action === 'getState') {
     chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      const domain = isActionableUrl(tab?.url) ? extractDomain(tab.url) : null;
+      const state = domain ? await getState(domain) : STATES.OFF;
       if (typeof msg.prefersDark === 'boolean' && msg.prefersDark !== prefersDark) {
         prefersDark = msg.prefersDark;
-        const domain = tab?.url ? extractDomain(tab.url) : null;
-        const state = domain ? await getState(domain) : STATES.OFF;
-        if (isActionableUrl(tab?.url)) updateIcon(state);
+        if (domain) updateIcon(state);
       }
-      const domain = tab?.url ? extractDomain(tab.url) : null;
-      respond({ state: domain ? await getState(domain) : STATES.OFF });
+      respond({ state, ports: await localPortsForState(state) });
     });
+    return true;
+  }
+  if (msg.action === 'getLocalPorts') {
+    const url = msg.url || sender.url;
+    const domain = isActionableUrl(url) ? extractDomain(url) : null;
+    (domain ? getState(domain) : Promise.resolve(STATES.OFF))
+      .then(localPortsForState)
+      .then(ports => respond({ ports }));
+    return true;
+  }
+  if (msg.action === 'getDefaultSettings') {
+    respond(structuredClone(DEFAULT_SETTINGS));
+    return false;
+  }
+  if (msg.action === 'pushServerConfig') {
+    pushServerConfig().then(() => respond({ ok: true }));
     return true;
   }
 });
 
-// Apply config at multiple points to ensure it's set before request goes out
+// Rules derive from storage: rebuild whenever states or settings change
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && (changes[STORAGE_KEY] || changes[SETTINGS_KEY])) scheduleSync();
+  if (area === 'local' && changes[SETTINGS_KEY]) pushServerConfig();
+});
+
+// Apply cookie at multiple points to ensure it's set before request goes out
 
 // 1. Before navigation starts (earliest possible)
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
@@ -266,6 +453,11 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
 chrome.tabs.onActivated.addListener(() => updateIconForActiveTab());
 
 // Initialize
-chrome.runtime.onInstalled.addListener(updateIconForActiveTab);
-chrome.runtime.onStartup.addListener(updateIconForActiveTab);
-updateIconForActiveTab();
+function init() {
+  updateIconForActiveTab();
+  scheduleSync();
+  pushServerConfig();
+}
+chrome.runtime.onInstalled.addListener(init);
+chrome.runtime.onStartup.addListener(init);
+init();

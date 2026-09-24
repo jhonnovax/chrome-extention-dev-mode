@@ -1,3 +1,30 @@
+const serverStatus = document.getElementById('server-status');
+
+// Show whether the local map-local server(s) the current mode relies on are reachable
+async function updateServerStatus(ports = []) {
+  if (!ports.length) {
+    serverStatus.hidden = true;
+    return;
+  }
+
+  const results = await Promise.all(ports.map(async (port) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/__health`, { cache: 'no-store' });
+      return { port, ok: res.ok };
+    } catch {
+      return { port, ok: false };
+    }
+  }));
+
+  const down = results.filter(r => !r.ok).map(r => `:${r.port}`);
+  serverStatus.hidden = false;
+  serverStatus.classList.toggle('ok', down.length === 0);
+  serverStatus.classList.toggle('down', down.length > 0);
+  serverStatus.querySelector('.text').textContent = down.length
+    ? `Local server ${down.join(', ')} not running`
+    : `Local server ${results.map(r => `:${r.port}`).join(', ')} running`;
+}
+
 // Get current state and update UI
 async function updateUI() {
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -7,6 +34,8 @@ async function updateUI() {
   document.querySelectorAll('.menu-item').forEach(item => {
     item.classList.toggle('active', item.dataset.state === currentState);
   });
+
+  updateServerStatus(response?.ports);
 }
 
 // Create ripple effect on click
@@ -43,6 +72,17 @@ document.querySelectorAll('.menu-item').forEach(item => {
     // Close popup after a brief delay for visual feedback
     setTimeout(() => window.close(), 150);
   });
+});
+
+// Open settings page
+document.getElementById('settings').addEventListener('click', () => {
+  chrome.runtime.openOptionsPage();
+  window.close();
+});
+
+serverStatus.addEventListener('click', () => {
+  chrome.runtime.openOptionsPage();
+  window.close();
 });
 
 // Initialize UI on load

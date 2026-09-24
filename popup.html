@@ -81,12 +81,10 @@
 
     .menu-item.dev .indicator { background: #00C853; }
     .menu-item.preview .indicator { background: #EAB308; }
-    .menu-item.prod .indicator { background: #D32F2F; }
     .menu-item.off .indicator { background: #9e9e9e; }
 
     .menu-item.dev.active .indicator { box-shadow: 0 0 6px #00C853; }
     .menu-item.preview.active .indicator { box-shadow: 0 0 6px #EAB308; }
-    .menu-item.prod.active .indicator { box-shadow: 0 0 6px #D32F2F; }
     .menu-item.off.active .indicator { box-shadow: 0 0 6px #9e9e9e; }
 
     .menu-item:not(.active) .indicator {
@@ -118,11 +116,6 @@
       color: #a16207;
     }
 
-    .menu-item.prod .badge {
-      background: rgba(211, 47, 47, 0.15);
-      color: #c62828;
-    }
-
     .menu-item.off .badge {
       background: rgba(158, 158, 158, 0.15);
       color: var(--text-secondary);
@@ -137,11 +130,6 @@
       .menu-item.preview .badge {
         background: rgba(234, 179, 8, 0.24);
         color: #facc15;
-      }
-
-      .menu-item.prod .badge {
-        background: rgba(211, 47, 47, 0.2);
-        color: #ef9a9a;
       }
 
       .menu-item.off .badge {
@@ -160,7 +148,6 @@
     .menu-item:nth-child(1) { animation-delay: 0s; }
     .menu-item:nth-child(2) { animation-delay: 0.03s; }
     .menu-item:nth-child(3) { animation-delay: 0.06s; }
-    .menu-item:nth-child(4) { animation-delay: 0.09s; }
 
     @keyframes slideIn {
       to {
@@ -190,9 +177,89 @@
         opacity: 0;
       }
     }
+
+    /* Header with settings button */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 6px 6px 12px;
+    }
+
+    .header .title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+
+    .settings-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    .settings-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    .settings-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    /* Local server status */
+    .server-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+
+    .server-status[hidden] { display: none; }
+
+    .server-status .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+      flex-shrink: 0;
+    }
+
+    .server-status.ok .dot { background: #00C853; box-shadow: 0 0 5px #00C853; }
+    .server-status.down .dot { background: #D32F2F; box-shadow: 0 0 5px #D32F2F; }
+    .server-status.down { color: #c62828; }
+
+    @media (prefers-color-scheme: dark) {
+      .server-status.down { color: #ef9a9a; }
+    }
   </style>
 </head>
 <body>
+  <div class="header">
+    <span class="title">Dev Mode</span>
+    <button class="settings-btn" id="settings" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+    </button>
+  </div>
   <div class="menu">
     <div class="menu-item off" data-state="off">
       <span class="indicator"></span>
@@ -209,11 +276,10 @@
       <span class="label">Preview</span>
       <span class="badge">PRE</span>
     </div>
-    <div class="menu-item prod" data-state="prod">
-      <span class="indicator"></span>
-      <span class="label">Production</span>
-      <span class="badge">PRO</span>
-    </div>
+  </div>
+  <div class="server-status" id="server-status" hidden title="Open settings">
+    <span class="dot"></span>
+    <span class="text"></span>
   </div>
   <script src="popup.js"></script>
 </body>

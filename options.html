@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dev Mode Settings</title>
+  <style>
+    :root {
+      --bg: #fff;
+      --bg-card: #f8f9fa;
+      --bg-hover: #f1f3f4;
+      --bg-input: #fff;
+      --text: #202124;
+      --text-secondary: #5f6368;
+      --border: #dadce0;
+      --accent: #1a73e8;
+      --danger: #d93025;
+      --ok: #00a344;
+      --shadow: rgba(0, 0, 0, 0.08);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #202124;
+        --bg-card: #292a2d;
+        --bg-hover: #3c3d40;
+        --bg-input: #1e1f21;
+        --text: #e8eaed;
+        --text-secondary: #9aa0a6;
+        --border: #5f6368;
+        --accent: #8ab4f8;
+        --danger: #f28b82;
+        --ok: #69f0ae;
+        --shadow: rgba(0, 0, 0, 0.3);
+      }
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      padding: 24px 16px 96px;
+    }
+
+    main { max-width: 960px; margin: 0 auto; }
+
+    h1 { font-size: 20px; font-weight: 500; margin-bottom: 4px; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 12px; }
+
+    section { margin-bottom: 32px; }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    h2 { font-size: 15px; font-weight: 500; }
+    .hint { color: var(--text-secondary); font-size: 12px; margin-bottom: 12px; }
+    .hint code { font-family: ui-monospace, Menlo, monospace; background: var(--bg-card); padding: 1px 4px; border-radius: 3px; }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 10px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px 14px;
+      align-items: start;
+    }
+    .card.disabled .fields { opacity: 0.55; }
+
+    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+    .fields .wide { grid-column: 1 / -1; }
+    @media (max-width: 640px) { .fields { grid-template-columns: 1fr; } }
+
+    label.field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--text-secondary); }
+    input[type="text"], input[type="number"] {
+      font: 13px ui-monospace, Menlo, monospace;
+      color: var(--text);
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 9px;
+      width: 100%;
+      outline: none;
+    }
+    input[type="text"]:focus, input[type="number"]:focus { border-color: var(--accent); }
+    input.invalid { border-color: var(--danger); }
+
+    .modes { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .modes span { font-size: 11px; color: var(--text-secondary); }
+    .modes label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; font-size: 12px; }
+
+    .banner {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 24px; font-size: 12px; color: var(--text-secondary);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); opacity: 0.5; display: inline-block; }
+    .dot.ok { background: var(--ok); opacity: 1; box-shadow: 0 0 6px var(--ok); }
+    .dot.down { background: var(--danger); opacity: 1; }
+
+    .error { grid-column: 1 / -1; color: var(--danger); font-size: 12px; }
+    .error:empty { display: none; }
+
+    button {
+      font: inherit;
+      color: var(--text);
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 12px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    button:hover { background: var(--bg-hover); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    @media (prefers-color-scheme: dark) { button.primary { color: #202124; } }
+    button.icon { border: none; padding: 4px 6px; color: var(--text-secondary); font-size: 16px; line-height: 1; }
+    button.icon:hover { color: var(--danger); }
+    button.small { padding: 4px 8px; font-size: 12px; }
+
+    .toggle { margin-top: 22px; }
+    .empty { color: var(--text-secondary); font-style: italic; padding: 8px 0 12px; }
+
+    footer {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      background: var(--bg);
+      border-top: 1px solid var(--border);
+      padding: 12px 16px;
+      box-shadow: 0 -2px 8px var(--shadow);
+    }
+    footer .inner { max-width: 960px; margin: 0 auto; display: flex; align-items: center; gap: 10px; }
+    footer .status { flex: 1; color: var(--text-secondary); font-size: 12px; }
+    footer .status.ok { color: var(--ok); }
+    footer .status.err { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Dev Mode Settings</h1>
+    <p class="subtitle">Rules are applied per mode on the domains where a mode is active. Changes take effect on save without reloading the extension.</p>
+    <div class="banner" id="server-banner"><span class="dot"></span><span class="text">Checking local server…</span></div>
+
+    <section>
+      <div class="section-head">
+        <h2>Map Local</h2>
+        <button class="small" id="add-map-local">+ Add</button>
+      </div>
+      <p class="hint">
+        Redirects matching requests to a local folder. Use <code>*</code> as wildcard; the last wildcard becomes the
+        path under the folder. Folders are sent to the local server automatically when you save.
+      </p>
+      <p class="hint">
+        Chrome asks once per site for <em>local network / apps on device</em> access — click <strong>Allow</strong>.
+        If you blocked it, re-enable it from the site info icon in the address bar. To never be asked, set the Chrome policy
+        <code>LocalNetworkAccessAllowedForUrls</code> (macOS: <code>defaults write com.google.Chrome LocalNetworkAccessAllowedForUrls -array "https://[*.]on24.com"</code>).
+      </p>
+      <div id="map-local-list"></div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Rewrites</h2>
+        <button class="small" id="add-rewrite">+ Add</button>
+      </div>
+      <p class="hint">
+        Regex (RE2) matched against the full URL; the matched part is replaced using <code>$1…$n</code>.
+        Rewrites run before Map Local, so a rewritten URL can then be mapped locally.
+      </p>
+      <div id="rewrite-list"></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="inner">
+      <span class="status" id="status"></span>
+      <button id="restore">Restore defaults</button>
+      <button class="primary" id="save">Save</button>
+    </div>
+  </footer>
+
+  <script src="options.js"></script>
+</body>
+</html>
