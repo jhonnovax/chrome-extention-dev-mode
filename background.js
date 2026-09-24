@@ -6,6 +6,7 @@ const SETTINGS_KEY = 'settings';
 const LOCAL_HOST = '127.0.0.1';
 const LOCAL_PORT = 4815;
 const LOCAL_ORIGIN = `http://${LOCAL_HOST}:${LOCAL_PORT}`;
+const DEBUGGER_VERSION = '1.3';
 
 const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview' };
 
@@ -125,6 +126,13 @@ async function getSettings() {
   return seeded;
 }
 
+// State for a URL (OFF for anything the extension can't act on)
+async function stateForUrl(url) {
+  if (!isActionableUrl(url)) return STATES.OFF;
+  const domain = extractDomain(url);
+  return domain ? getState(domain) : STATES.OFF;
+}
+
 // Update extension icon
 function updateIcon(state) {
   const { title } = STATE_CONFIG[state];
@@ -132,7 +140,7 @@ function updateIcon(state) {
   chrome.action.setTitle({ title });
 }
 
-// Apply state configuration (cookie). Network rules are handled by syncRules().
+// Apply state configuration (cookie). Network rules are handled by syncRules() / interception.
 async function applyConfig(state, url) {
   const config = STATE_CONFIG[normalizeState(state)];
   const domain = url ? extractDomain(url) : null;
@@ -153,27 +161,42 @@ async function applyConfig(state, url) {
   }
 }
 
-// ---- declarativeNetRequest rule building ----
+// ---- Map Local / Rewrite resolution ----
 
 function escapeRegex(str) {
   return str.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Glob pattern ("https://*/view/orion/*") -> anchored RE2 regex, each * is a capture group
+// Glob pattern ("https://*/view/orion/*") -> anchored regex, each * is a capture group
 function globToRegex(pattern) {
   const regex = pattern.split('*').map(escapeRegex).join('(.*)');
   return { regex: `^${regex}$`, groups: pattern.split('*').length - 1 };
 }
 
-// "$1" style replacement -> DNR regexSubstitution ("\1")
-function toSubstitution(replacement) {
-  return replacement.replace(/\$(\d+)/g, '\\$1');
+const enabledFor = (list, state) => list.filter(e => e.enabled !== false && e.modes?.includes(state));
+
+// Apply the state's rewrite rules to a URL (Charles "Rewrite"); returns the possibly changed URL
+function applyRewrites(url, settings, state) {
+  let current = url;
+  for (const rw of enabledFor(settings.rewrites, state)) {
+    if (!rw.regex) continue;
+    try { current = current.replace(new RegExp(rw.regex, 'i'), rw.replacement || ''); } catch { /* invalid regex */ }
+  }
+  return current;
 }
 
-// Each rule is a "mount" on the local server: /m/<ruleId>/<last wildcard>
-function mapLocalTarget(entry) {
-  const { groups } = globToRegex(entry.pattern);
-  return `${LOCAL_ORIGIN}/m/${entry.id}/` + (groups ? `\\${groups}` : '');
+// First map-local rule matching the URL -> local server URL (/m/<ruleId>/<last wildcard>) or null
+function mapLocalTarget(url, settings, state) {
+  const bare = url.split(/[?#]/)[0];
+  for (const ml of enabledFor(settings.mapLocal, state)) {
+    if (!ml.pattern || !ml.id) continue;
+    const { regex, groups } = globToRegex(ml.pattern);
+    let match;
+    try { match = bare.match(new RegExp(regex, 'i')); } catch { continue; }
+    if (!match) continue;
+    return `${LOCAL_ORIGIN}/m/${ml.id}/` + (groups ? match[groups] : '');
+  }
+  return null;
 }
 
 // Tell the local server which folders to serve (all enabled map-local rules, any mode)
@@ -194,117 +217,182 @@ async function pushServerConfig() {
   }
 }
 
-// Same rule body twice: once scoped to requests made by the page (sub-resources),
-// once scoped to requests going to the domain itself (direct navigations)
-function scopedRules(domain, base) {
-  return [
-    { ...base, condition: { ...base.condition, initiatorDomains: [domain] } },
-    { ...base, condition: { ...base.condition, requestDomains: [domain] } }
-  ];
-}
+// ---- Request interception (chrome.debugger + Fetch domain) ----
+// Like Charles: the page keeps the original URL/origin. Map Local answers the request with
+// the local file (Fetch.fulfillRequest); Rewrite changes the URL invisibly (Fetch.continueRequest).
 
-async function regexOk(regex) {
-  try {
-    const result = await chrome.declarativeNetRequest.isRegexSupported({ regex, isCaseSensitive: false });
-    return result.isSupported;
-  } catch {
-    return false;
+const attachedTabs = new Set();
+const userDetachedTabs = new Set();
+const warnedUrls = new Set();
+let keepAliveTimer = null;
+
+function updateKeepAlive() {
+  if (attachedTabs.size && !keepAliveTimer) {
+    keepAliveTimer = setInterval(() => chrome.runtime.getPlatformInfo(), 20_000);
+  } else if (!attachedTabs.size && keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
   }
 }
 
-// Rebuild the complete dynamic rule set from stored domain states + settings
-async function syncRules() {
-  const [{ [STORAGE_KEY]: states = {} }, settings] = await Promise.all([
-    chrome.storage.local.get(STORAGE_KEY),
-    getSettings()
-  ]);
+function sendCommand(tabId, method, params) {
+  return chrome.debugger.sendCommand({ tabId }, method, params);
+}
 
+// Fetch.enable patterns for a state: raw globs of map-local rules; '*' when any rewrite applies
+async function interceptPatterns(state) {
+  const settings = await getSettings();
+  const patterns = enabledFor(settings.mapLocal, state)
+    .filter(e => e.pattern)
+    .map(e => ({ urlPattern: e.pattern, requestStage: 'Request' }));
+  if (enabledFor(settings.rewrites, state).some(e => e.regex)) {
+    return [{ urlPattern: '*', requestStage: 'Request' }];
+  }
+  return patterns;
+}
+
+async function enableInterception(tabId, state) {
+  const patterns = await interceptPatterns(state);
+  if (!patterns.length) {
+    await sendCommand(tabId, 'Fetch.disable').catch(() => {});
+    return;
+  }
+  await sendCommand(tabId, 'Fetch.enable', { patterns });
+}
+
+async function attachTab(tabId, state) {
+  if (attachedTabs.has(tabId)) {
+    await enableInterception(tabId, state).catch(() => {});
+    return;
+  }
+  if (userDetachedTabs.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+  } catch (err) {
+    // Already attached by us in a previous worker life, or not attachable (chrome://, another debugger)
+    if (!/already attached/i.test(err?.message || '')) return;
+  }
+  attachedTabs.add(tabId);
+  updateKeepAlive();
+  try {
+    await enableInterception(tabId, state);
+  } catch (err) {
+    console.warn('[Dev Mode] Fetch.enable failed', err);
+  }
+}
+
+async function detachTab(tabId) {
+  if (!attachedTabs.has(tabId)) return;
+  attachedTabs.delete(tabId);
+  updateKeepAlive();
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+}
+
+// Attach or detach a tab according to the state of its current URL
+async function syncTab(tabId, url) {
+  const state = await stateForUrl(url);
+  if (state === STATES.OFF) await detachTab(tabId);
+  else await attachTab(tabId, state);
+}
+
+// Re-evaluate every open tab (worker start, settings change)
+async function syncAllTabs() {
+  const tabs = await chrome.tabs.query({});
+  await Promise.all(tabs.map(tab => syncTab(tab.id, tab.url)));
+}
+
+function toBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function onRequestPaused(tabId, params) {
+  const { requestId, request } = params;
+  const finish = (method, extra = {}) =>
+    sendCommand(tabId, method, { requestId, ...extra }).catch(() => {});
+
+  try {
+    const [state, settings] = await Promise.all([stateForUrl(request.url), getSettings()]);
+    if (state === STATES.OFF) return finish('Fetch.continueRequest');
+
+    const rewritten = applyRewrites(request.url, settings, state);
+    const local = mapLocalTarget(rewritten, settings, state);
+
+    if (local) {
+      let res = null;
+      try {
+        res = await fetch(local, { cache: 'no-store' });
+      } catch {
+        if (!warnedUrls.has('server')) {
+          warnedUrls.add('server');
+          console.warn('[Dev Mode] Local server not reachable; serving from the real site. Run "npm run install-service" once.');
+        }
+      }
+      if (res?.ok) {
+        const body = toBase64(await res.arrayBuffer());
+        const responseHeaders = [
+          { name: 'Content-Type', value: res.headers.get('content-type') || 'application/octet-stream' },
+          { name: 'Cache-Control', value: 'no-store' },
+          { name: 'X-Dev-Mode', value: 'map-local' }
+        ];
+        if (request.headers?.Origin || request.headers?.origin) {
+          responseHeaders.push({ name: 'Access-Control-Allow-Origin', value: request.headers.Origin || request.headers.origin });
+          responseHeaders.push({ name: 'Access-Control-Allow-Credentials', value: 'true' });
+        }
+        return finish('Fetch.fulfillRequest', { responseCode: 200, responseHeaders, body });
+      }
+      if (res && !warnedUrls.has(rewritten)) {
+        warnedUrls.add(rewritten);
+        console.warn(`[Dev Mode] No local file for ${rewritten} (${res.status}); serving from the real site.`);
+      }
+    }
+
+    if (rewritten !== request.url) return finish('Fetch.continueRequest', { url: rewritten });
+    return finish('Fetch.continueRequest');
+  } catch (err) {
+    console.error('[Dev Mode] interception error', err);
+    return finish('Fetch.continueRequest');
+  }
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === 'Fetch.requestPaused' && source.tabId != null) onRequestPaused(source.tabId, params);
+});
+
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (source.tabId == null) return;
+  attachedTabs.delete(source.tabId);
+  updateKeepAlive();
+  // User clicked "Cancel" on the debugging bar: leave the tab alone until it navigates again
+  if (reason === 'canceled_by_user') userDetachedTabs.add(source.tabId);
+});
+
+// ---- declarativeNetRequest: no-cache headers for domains with cache disabled ----
+
+async function syncRules() {
+  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
   const rules = [];
-  let usesLocalServer = false;
-  const enabled = (list) => list.filter(e => e.enabled !== false);
 
   for (const [rawDomain, rawState] of Object.entries(states)) {
     const state = normalizeState(rawState);
-    const config = STATE_CONFIG[state];
     const domain = rawDomain.replace(/^\./, '');
-    if (state === STATES.OFF || !domain) continue;
+    if (state === STATES.OFF || !domain || STATE_CONFIG[state].cache) continue;
 
-    if (!config.cache) {
-      rules.push({
-        priority: 1,
-        action: {
-          type: 'modifyHeaders',
-          requestHeaders: [
-            { header: 'Cache-Control', operation: 'set', value: 'no-cache, no-store, must-revalidate' },
-            { header: 'Pragma', operation: 'set', value: 'no-cache' }
-          ]
-        },
-        condition: { requestDomains: [domain], resourceTypes: ALL_RESOURCE_TYPES }
-      });
-    }
-
-    for (const entry of enabled(settings.rewrites)) {
-      if (!entry.modes?.includes(state) || !entry.regex) continue;
-      if (!(await regexOk(entry.regex))) {
-        console.warn('[Dev Mode] Unsupported rewrite regex skipped:', entry.regex);
-        continue;
-      }
-      rules.push(...scopedRules(domain, {
-        priority: 3,
-        action: { type: 'redirect', redirect: { regexSubstitution: toSubstitution(entry.replacement || '') } },
-        condition: { regexFilter: entry.regex, isUrlFilterCaseSensitive: false, resourceTypes: ALL_RESOURCE_TYPES }
-      }));
-    }
-
-    let hasMapLocal = false;
-    for (const entry of enabled(settings.mapLocal)) {
-      if (!entry.modes?.includes(state) || !entry.pattern || !entry.id) continue;
-      const { regex } = globToRegex(entry.pattern);
-      if (!(await regexOk(regex))) {
-        console.warn('[Dev Mode] Unsupported map-local pattern skipped:', entry.pattern);
-        continue;
-      }
-      hasMapLocal = true;
-      usesLocalServer = true;
-      rules.push(...scopedRules(domain, {
-        priority: 2,
-        action: { type: 'redirect', redirect: { regexSubstitution: mapLocalTarget(entry) } },
-        condition: { regexFilter: regex, isUrlFilterCaseSensitive: false, resourceTypes: ALL_RESOURCE_TYPES }
-      }));
-    }
-
-    // Pages loading mapped assets from 127.0.0.1 must not be blocked by the site's CSP
-    if (hasMapLocal) {
-      rules.push({
-        priority: 1,
-        action: {
-          type: 'modifyHeaders',
-          responseHeaders: [
-            { header: 'Content-Security-Policy', operation: 'remove' },
-            { header: 'Content-Security-Policy-Report-Only', operation: 'remove' }
-          ]
-        },
-        condition: { requestDomains: [domain], resourceTypes: ['main_frame', 'sub_frame'] }
-      });
-    }
-  }
-
-  // Local server responses: permissive CORS so fonts / fetch / crossorigin scripts work from any page
-  if (usesLocalServer) {
     rules.push({
       priority: 1,
       action: {
         type: 'modifyHeaders',
-        responseHeaders: [
-          { header: 'Access-Control-Allow-Origin', operation: 'set', value: '*' },
-          { header: 'Access-Control-Allow-Headers', operation: 'set', value: '*' },
-          { header: 'Access-Control-Allow-Methods', operation: 'set', value: 'GET, HEAD, OPTIONS' },
-          { header: 'Access-Control-Allow-Private-Network', operation: 'set', value: 'true' },
-          { header: 'Cross-Origin-Resource-Policy', operation: 'set', value: 'cross-origin' },
-          { header: 'Timing-Allow-Origin', operation: 'set', value: '*' }
+        requestHeaders: [
+          { header: 'Cache-Control', operation: 'set', value: 'no-cache, no-store, must-revalidate' },
+          { header: 'Pragma', operation: 'set', value: 'no-cache' }
         ]
       },
-      condition: { regexFilter: `^${escapeRegex(LOCAL_ORIGIN)}/`, resourceTypes: ALL_RESOURCE_TYPES }
+      condition: { requestDomains: [domain], resourceTypes: ALL_RESOURCE_TYPES }
     });
   }
 
@@ -326,7 +414,7 @@ function scheduleSync() {
 // Ports the given state relies on: [LOCAL_PORT] when any map-local rule is active, else []
 async function localPortsForState(state) {
   const settings = await getSettings();
-  const uses = settings.mapLocal.some(e => e.enabled !== false && e.modes?.includes(state) && e.pattern);
+  const uses = enabledFor(settings.mapLocal, state).some(e => e.pattern);
   return uses ? [LOCAL_PORT] : [];
 }
 
@@ -359,13 +447,15 @@ async function setState(newState) {
     await saveState(domain, normalizedState);
     await scheduleSync();
     await applyConfig(normalizedState, tab.url);
+    userDetachedTabs.delete(tab.id);
+    await syncAllTabs();
     updateIcon(normalizedState);
     chrome.tabs.reload(tab.id, { bypassCache: true });
   }
 }
 
 // Message handler
-chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg.action === 'setState') {
     setState(msg.state).then(() => respond({ success: true }));
     return true;
@@ -382,14 +472,6 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     });
     return true;
   }
-  if (msg.action === 'getLocalPorts') {
-    const url = msg.url || sender.url;
-    const domain = isActionableUrl(url) ? extractDomain(url) : null;
-    (domain ? getState(domain) : Promise.resolve(STATES.OFF))
-      .then(localPortsForState)
-      .then(ports => respond({ ports }));
-    return true;
-  }
   if (msg.action === 'getDefaultSettings') {
     respond(structuredClone(DEFAULT_SETTINGS));
     return false;
@@ -400,10 +482,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   }
 });
 
-// Rules derive from storage: rebuild whenever states or settings change
+// Rules and interception derive from storage: rebuild whenever states or settings change
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && (changes[STORAGE_KEY] || changes[SETTINGS_KEY])) scheduleSync();
-  if (area === 'local' && changes[SETTINGS_KEY]) pushServerConfig();
+  if (area !== 'local') return;
+  if (changes[STORAGE_KEY] || changes[SETTINGS_KEY]) {
+    scheduleSync();
+    syncAllTabs();
+  }
+  if (changes[SETTINGS_KEY]) pushServerConfig();
 });
 
 // Apply cookie at multiple points to ensure it's set before request goes out
@@ -414,15 +500,20 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   const domain = extractDomain(details.url);
   if (!domain) return;
 
+  // A fresh top-level navigation ends a user-cancelled debugging session's grace period
+  userDetachedTabs.delete(details.tabId);
+  syncTab(details.tabId, details.url);
+
   const state = await getState(domain);
   await applyConfig(state, details.url);
 });
 
 // 2. When tab URL changes (catches new tabs)
-chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
 
   if (!isActionableUrl(changeInfo.url)) {
+    detachTab(tabId);
     updateIcon(STATES.OFF);
     return;
   }
@@ -431,6 +522,7 @@ chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
   if (!domain) return;
 
   const state = await getState(domain);
+  await syncTab(tabId, changeInfo.url);
   await applyConfig(state, changeInfo.url);
 
   if (tab.active) updateIcon(state);
@@ -449,6 +541,12 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
   if (activeTab?.id === details.tabId) updateIcon(state);
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  attachedTabs.delete(tabId);
+  userDetachedTabs.delete(tabId);
+  updateKeepAlive();
+});
+
 // Update icon when switching tabs
 chrome.tabs.onActivated.addListener(() => updateIconForActiveTab());
 
@@ -457,6 +555,7 @@ function init() {
   updateIconForActiveTab();
   scheduleSync();
   pushServerConfig();
+  syncAllTabs();
 }
 chrome.runtime.onInstalled.addListener(init);
 chrome.runtime.onStartup.addListener(init);

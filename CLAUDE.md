@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chrome Extension (Manifest V3) that toggles development mode for on24.com domains by managing a cookie (`htm-dev-mode`) plus user-configurable **Map Local** and **Rewrite** rules implemented with `declarativeNetRequest`. No proxy is used.
+Chrome Extension (Manifest V3) that toggles development mode for on24.com domains by managing a cookie (`htm-dev-mode`) plus user-configurable **Map Local** and **Rewrite** rules, implemented Charles-style with `chrome.debugger` (Fetch domain): the page keeps its real URL/origin, only the response body (map local) or the outgoing URL (rewrite) is changed. No proxy is used.
 
 ## Development
 
@@ -16,50 +16,47 @@ No build step required. This is a plain JavaScript extension.
 3. Click "Load unpacked" and select this directory
 4. After code changes, click the refresh icon on the extension card
 
-**Local server for Map Local rules** (a Chrome extension cannot read disk, so mapped requests are redirected to `http://127.0.0.1:4815`):
+**Local server for Map Local rules** (a Chrome extension cannot read disk; the service worker fetches files from `http://127.0.0.1:4815` — the page never talks to it):
 ```
 npm run install-service      # macOS launchd agent com.devmode.serve: starts at login, auto-restarts
 npm run uninstall-service
 npm run serve                # or run it manually in a terminal
 ```
-`local-server/serve.js` is zero-dependency and has no folder configuration of its own: the extension POSTs `{ mounts: { <ruleId>: <folder> } }` to `/__config` on startup and whenever settings are saved (only `chrome-extension://` origins are accepted; persisted in `~/.devmode-serve.json`). Files are served at `/m/<ruleId>/<path>` with permissive CORS + `Cache-Control: no-store`. `GET /__health` returns `{ ok, port, mounts: { id: { dir, exists } } }` for the popup/options status. Log: `~/Library/Logs/devmode-serve.log`. The port is fixed (`LOCAL_PORT` in background.js, `--port` in the install script).
+`local-server/serve.js` is zero-dependency and has no folder configuration of its own: the extension POSTs `{ mounts: { <ruleId>: <folder> } }` to `/__config` on startup and whenever settings are saved (only `chrome-extension://` origins are accepted; persisted in `~/.devmode-serve.json`). Files are served at `/m/<ruleId>/<path>`. `GET /__health` returns `{ ok, port, mounts: { id: { dir, exists } } }` for the popup/options status. Log: `~/Library/Logs/devmode-serve.log`. The port is fixed (`LOCAL_PORT` in background.js, `--port` in the install script).
 
 ## Architecture
 
 **background.js** - Service worker containing extension logic:
 - Manages three states: OFF, DEV, PREVIEW (per root domain, persisted in `chrome.storage.local.domainStates`; unknown/legacy values such as `prod` normalize to OFF)
 - Sets/removes cookie `htm-dev-mode=4815162342` on `.on24.com`
-- `syncRules()` rebuilds the **entire** DNR dynamic rule set from `domainStates` + `settings` whenever either changes (`chrome.storage.onChanged`), on install/startup and on worker start. Rule IDs are assigned sequentially on every rebuild.
+- **Interception:** tabs whose URL's domain is in DEV/PREVIEW get `chrome.debugger.attach` + `Fetch.enable` (`attachTab`/`detachTab`/`syncTab`/`syncAllTabs`). Patterns = the raw map-local globs, or `*` when any rewrite rule applies to the state. On `Fetch.requestPaused`: apply rewrites (`applyRewrites`, JS `String.replace` with `$n`) → first matching map-local rule (`mapLocalTarget`, `globToRegex`) → fetch `/m/<id>/<path>` from the local server → `Fetch.fulfillRequest` (200, server Content-Type, base64 body) or, if missing/server down, `Fetch.continueRequest` (with `url` when a rewrite changed it). Every paused request is answered exactly once.
+- Attach triggers: `setState`, `webNavigation.onBeforeNavigate`, `tabs.onUpdated` (url), `storage.onChanged`, `init()` (re-attaches all open tabs after a worker restart). `onDetach` with `canceled_by_user` (user clicked Cancel on the debugging bar) marks the tab as user-detached until its next top-level navigation. A 20 s `getPlatformInfo` keep-alive runs while any tab is attached.
+- `syncRules()` keeps a single kind of `declarativeNetRequest` dynamic rule: no-cache request headers per active domain
 - Generates dynamic badge icons using OffscreenCanvas
 - Auto-reloads the tab when state changes
 
 **options.html / options.js** - Settings page (gear icon in popup, or chrome://extensions → Details → Extension options):
-- Any number of Map Local and Rewrite rules, each with enabled flag and the modes it applies to
-- Validates regexes with `chrome.declarativeNetRequest.isRegexSupported`, writes `chrome.storage.local.settings`
-- Shows the `serve.js` command per Map Local rule and a live health dot
+- Any number of Map Local (`pattern`, `localPath`, `modes`) and Rewrite (`regex`, `replacement`, `modes`) rules, each with an enabled flag
+- Validates regexes with `new RegExp`, writes `chrome.storage.local.settings`; background then re-syncs interception and pushes folders to the server
+- Shows local-server status (dot + text under the title)
 
 **popup.html / popup.js** - Dropdown menu UI:
 - Styled dark theme dropdown with three options, gear button to settings
 - Shows local server status when the active mode uses Map Local rules
 - Communicates with background.js via chrome.runtime.sendMessage
 
-**content.js** - Content script (`document_start`, top frame only):
-- Asks background whether the current domain's mode uses Map Local; if so, does one `fetch(http://127.0.0.1:4815/__health, { targetAddressSpace: 'loopback' })`
-- This triggers Chrome's Local Network Access permission prompt (Chrome 142+; permission `local-network-access`, `loopback-network` on 145+). Redirected sub-resources cannot trigger the prompt themselves and fail with "Permission was denied for this request to access the loopback address space"
-- Reloads the page once when the permission flips to `granted`. Prompt-less alternative: policy `LocalNetworkAccessAllowedForUrls`
-
 **local-server/serve.js** - Static file server for Map Local (see above)
 
 **manifest.json** - Extension configuration (Manifest V3):
-- Permissions: `cookies`, `declarativeNetRequest`, `tabs`, `webNavigation`, `storage`
-- Host permissions: `<all_urls>` (needed for redirects to 127.0.0.1 and header modification)
+- Permissions: `cookies`, `debugger`, `declarativeNetRequest`, `tabs`, `webNavigation`, `storage`
+- Host permissions: `<all_urls>`
 
 ## Key Implementation Details
 
 **States:**
 | State | Icon | Label | Cookie | Cache | Rules |
 |-------|------|-------|--------|-------|-------|
-| OFF | Gray | OFF | deleted | enabled | none |
+| OFF | Gray | OFF | deleted | enabled | none (tab detached) |
 | DEV | Green | DEV | SET (`htm-dev-mode=4815162342`) | disabled | rules whose `modes` include `dev` |
 | PREVIEW | Yellow | PRE | deleted | disabled | rules whose `modes` include `preview` |
 
@@ -71,14 +68,9 @@ npm run serve                # or run it manually in a terminal
 }
 ```
 
-**DNR rules generated per active domain** (`background.js` `syncRules()`):
-- No-cache request headers (priority 1, `requestDomains`)
-- Rewrite: `regexFilter` → `redirect.regexSubstitution` (priority 3). Matched span is replaced; `$n` → `\n`
-- Map Local: glob → anchored RE2 (`*` = capture group) → `http://127.0.0.1:4815/m/<ruleId>/\<last group>` (priority 2)
-- Rewrite and Map Local rules are emitted twice: scoped by `initiatorDomains` (page sub-resources) and `requestDomains` (direct navigation)
-- Chrome re-evaluates redirected requests, so Rewrite → Map Local chains (`production-js-<hash>.js` → `production-js.js` → local file)
-- CSP / CSP-Report-Only response headers removed on `main_frame`/`sub_frame` of domains with an active Map Local rule
-- Permissive CORS / CORP response headers set on `http://127.0.0.1:4815/` responses
+**Request flow (Fetch domain):** Rewrite runs before Map Local, so in PREVIEW `…/dist/production-js-<hash>.js` → `…/dist/production-js.js` → local `static/labs/dist/production-js.js`, while the page still sees the hashed URL. HTML documents and iframes are mapped the same way as assets (no origin change, cookies and same-origin API calls keep working).
+
+**Debugging bar:** Chrome shows *"Dev Mode started debugging this browser"* on attached tabs. It can be hidden by launching Chrome with `--silent-debugger-extension-api`. DevTools can be open at the same time (multi-client).
 
 **UI Features:**
 - Dark theme popup with animated menu items, click ripple, active indicator

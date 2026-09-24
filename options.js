@@ -173,10 +173,11 @@ function renderAll() {
 
 // ---- validation & persistence ----
 
+// Rules are evaluated with JavaScript RegExp; returns an error message or null
 async function regexSupported(regex) {
   try {
-    const r = await chrome.declarativeNetRequest.isRegexSupported({ regex, isCaseSensitive: false });
-    return r.isSupported ? null : (r.reason || 'unsupported');
+    new RegExp(regex, 'i');
+    return null;
   } catch (e) {
     return e.message;
   }

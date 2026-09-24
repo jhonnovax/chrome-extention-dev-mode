@@ -158,9 +158,9 @@
         path under the folder. Folders are sent to the local server automatically when you save.
       </p>
       <p class="hint">
-        Chrome asks once per site for <em>local network / apps on device</em> access — click <strong>Allow</strong>.
-        If you blocked it, re-enable it from the site info icon in the address bar. To never be asked, set the Chrome policy
-        <code>LocalNetworkAccessAllowedForUrls</code> (macOS: <code>defaults write com.google.Chrome LocalNetworkAccessAllowedForUrls -array "https://[*.]on24.com"</code>).
+        While Development or Preview is active, Chrome shows a <em>"Dev Mode started debugging this browser"</em> bar on
+        those tabs — that is the interception at work (the page keeps its real URL, like Charles). Clicking
+        <strong>Cancel</strong> on the bar pauses mapping for that tab until the next navigation.
       </p>
       <div id="map-local-list"></div>
     </section>
@@ -171,7 +171,7 @@
         <button class="small" id="add-rewrite">+ Add</button>
       </div>
       <p class="hint">
-        Regex (RE2) matched against the full URL; the matched part is replaced using <code>$1…$n</code>.
+        Regex matched against the full URL; the matched part is replaced using <code>$1…$n</code>. The page never sees the new URL.
         Rewrites run before Map Local, so a rewritten URL can then be mapped locally.
       </p>
       <div id="rewrite-list"></div>
