@@ -382,9 +382,17 @@ async function interceptPatterns(state) {
   return patterns;
 }
 
+// Current mode of a tab, read from its live URL and the stored modes (OFF when the tab is gone)
+async function currentTabState(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  return stateForUrl(tab?.url);
+}
+
 async function enableInterception(tabId, state) {
-  tabStates.set(tabId, state);
   const patterns = await interceptPatterns(state);
+  // The mode may have been switched to OFF while the patterns were being read
+  if ((await currentTabState(tabId)) === STATES.OFF) throw new Error('mode is OFF');
+  tabStates.set(tabId, state);
   if (!patterns.length) {
     await sendCommand(tabId, 'Fetch.disable').catch(() => {});
     return;
@@ -397,12 +405,16 @@ const attaching = new Map(); // tabId -> in-flight attach promise
 
 // Attach + enable interception. `reloadAfter`: the call comes from a navigation whose document
 // request may already be in flight, so reload once when this call performed a new attach.
+// OFF is re-checked after every await: a mode switch that lands mid-attach must win, otherwise the
+// tab would stay attached (debugging bar, interception) although the popup shows Off.
 async function attachTab(tabId, state, { reloadAfter = false } = {}) {
+  if (state === STATES.OFF) return detachTab(tabId);
   if (attachedTabs.has(tabId)) {
     try {
       await enableInterception(tabId, state);
       return;
-    } catch {
+    } catch (err) {
+      if (/mode is OFF/.test(err?.message || '')) return detachTab(tabId);
       // Session is gone (worker restart, DevTools took over…) — attach again below
       attachedTabs.delete(tabId);
     }
@@ -427,6 +439,11 @@ async function attachTab(tabId, state, { reloadAfter = false } = {}) {
     try {
       await enableInterception(tabId, state);
     } catch (err) {
+      if (/mode is OFF/.test(err?.message || '')) {
+        console.info(`[Dev Mode] tab ${tabId} switched to OFF during attach, detaching`);
+        await forceDetach(tabId);
+        return;
+      }
       console.warn(`[Dev Mode] Fetch.enable failed on tab ${tabId}: ${err?.message}`);
       attachedTabs.delete(tabId);
       updateKeepAlive();
@@ -449,7 +466,7 @@ async function attachTab(tabId, state, { reloadAfter = false } = {}) {
 
 // Always ask Chrome to detach: the in-memory set is lost when the service worker restarts,
 // but the debugger session is not, so it must not be the only source of truth
-async function detachTab(tabId) {
+async function forceDetach(tabId) {
   const known = attachedTabs.delete(tabId);
   tabStates.delete(tabId);
   updateKeepAlive();
@@ -459,6 +476,13 @@ async function detachTab(tabId) {
   } catch (err) {
     if (known) console.warn(`[Dev Mode] detach tab ${tabId} failed: ${err?.message}`);
   }
+}
+
+// Detach after any attach still in flight for the tab, so a detach requested during an attach
+// is not overtaken by it (Chrome would otherwise keep the session the attach opens)
+async function detachTab(tabId) {
+  if (attaching.has(tabId)) await attaching.get(tabId).catch(() => {});
+  await forceDetach(tabId);
 }
 
 // Rebuild the attached set from Chrome after a worker (re)start
@@ -525,7 +549,13 @@ async function onRequestPaused(tabId, params) {
       tabStates.set(tabId, state);
     }
     const settings = await getSettings();
-    if (state === STATES.OFF) return finish('Fetch.continueRequest');
+    if (state === STATES.OFF) {
+      // An OFF tab must browse as if the extension were not installed: pass the request
+      // through untouched and end the debugger session that is still delivering events
+      await finish('Fetch.continueRequest');
+      detachTab(tabId);
+      return;
+    }
 
     const rewritten = applyRewrites(request.url, settings, state);
     const hit = mapLocalTarget(rewritten, settings, state);
@@ -796,6 +826,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 // here as well as for changes arriving from another machine through Chrome sync.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes[STORAGE_KEY]) {
+    // Forget the mode each attached tab was enabled with: the next paused request re-reads it
+    tabStates.clear();
     scheduleSync();
     ensureReady().then(syncAllTabs);
     // Globals depend on the domain state too (not injected while OFF)
