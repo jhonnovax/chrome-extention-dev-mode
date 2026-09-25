@@ -29,7 +29,7 @@ No build step required. This is a plain JavaScript extension. No local server, n
 
 **sync-schema.js** - Config store shared by `background.js` (`importScripts`) and `options.js` (`<script>`), exposed as `DevModeConfig`:
 - Keys in `chrome.storage.sync`: `meta { schema, updatedAt }`, `rule:<id>` (`{ kind: 'mapLocal'|'rewrite', order, enabled, modes, pattern, localPath | regex, replacement }`), `globals:<domain>` (`[{ name, value }]`)
-- `readConfig()` → `{ mapLocal, rewrites, globals, seeded }`; with no `meta` key it returns `DEFAULT_SETTINGS` **without writing**, so a fresh machine never overwrites cloud data. `writeSettings({ mapLocal, rewrites })` = one `set()` + one `remove()` of dropped rule keys; `writeGlobals(domain, list)`. Quota errors propagate to the caller.
+- `readConfig()` → `{ mapLocal, rewrites, globals, seeded }`; with no `meta` key it returns `DEFAULT_SETTINGS` **without writing**, so a fresh machine never overwrites cloud data. `writeSettings({ mapLocal, rewrites })` = one `set()` + one `remove()` of dropped rule keys; `writeGlobals(domain, list)`; on a never-written store it also writes the `DEFAULT_SETTINGS` rules in the same `set()`, because writing `meta` ends the defaults fallback (before this fix, saving a global on a fresh machine left the store with zero rules and Map Local silently stopped). Quota errors propagate to the caller.
 
 **background.js** - Service worker containing extension logic:
 - Manages three states: OFF, DEV, PREVIEW (per root domain, persisted in `chrome.storage.local.domainStates`; unknown/legacy values such as `prod` normalize to OFF)

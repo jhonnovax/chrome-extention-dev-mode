@@ -100,14 +100,23 @@ const DevModeConfig = (() => {
     if (stale.length) await chrome.storage.sync.remove(stale);
   }
 
+  // Writing `meta` marks the store as seeded, after which readConfig() stops falling back to
+  // DEFAULT_SETTINGS: on a never-written store the defaults in effect are written in the same set(),
+  // or saving a global would silently drop every rule.
   async function writeGlobals(domain, list) {
-    const meta = { schema: SCHEMA, updatedAt: Date.now() };
+    const items = { [META_KEY]: { schema: SCHEMA, updatedAt: Date.now() } };
+    const { [META_KEY]: seeded } = await chrome.storage.sync.get(META_KEY);
+    if (!seeded) {
+      let order = 0;
+      for (const e of DEFAULT_SETTINGS.mapLocal) items[ruleKey(e.id)] = entryToRule('mapLocal', e, order++);
+      for (const e of DEFAULT_SETTINGS.rewrites) items[ruleKey(e.id)] = entryToRule('rewrite', e, order++);
+    }
     if (Array.isArray(list) && list.length) {
-      await chrome.storage.sync.set({ [META_KEY]: meta, [globalsKey(domain)]: list });
+      items[globalsKey(domain)] = list;
     } else {
       await chrome.storage.sync.remove(globalsKey(domain));
-      await chrome.storage.sync.set({ [META_KEY]: meta });
     }
+    await chrome.storage.sync.set(items);
   }
 
   return {
