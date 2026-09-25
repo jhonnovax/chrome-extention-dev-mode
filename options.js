@@ -1,4 +1,3 @@
-const SETTINGS_KEY = 'settings';
 const MODES = [
   { id: 'dev', label: 'DEV' },
   { id: 'preview', label: 'PREVIEW' }
@@ -91,45 +90,56 @@ function cardShell(entry, list, rerender) {
   return { card, fields, error };
 }
 
-const LOCAL_ORIGIN = 'http://127.0.0.1:4815';
+// ---- file access (Map Local reads the folders straight from disk) ----
 
-// Latest /__health payload (null when the server is unreachable); refreshed on a timer
-let serverHealth = null;
-const healthListeners = new Set();
-
-async function pollHealth() {
+async function fileAccessAllowed() {
   try {
-    const res = await fetch(`${LOCAL_ORIGIN}/__health`, { cache: 'no-store' });
-    serverHealth = res.ok ? await res.json() : null;
+    return await chrome.extension.isAllowedFileSchemeAccess();
   } catch {
-    serverHealth = null;
+    return false;
   }
-  healthListeners.forEach(fn => fn());
 }
 
-function renderServerBanner() {
-  const banner = document.getElementById('server-banner');
+async function renderFileAccessBanner() {
+  const banner = document.getElementById('file-access-banner');
   const dot = banner.querySelector('.dot');
   const text = banner.querySelector('.text');
-  if (serverHealth) {
-    const missing = settings.mapLocal.filter(e => {
-      const mount = serverHealth.mounts?.[e.id];
-      return e.enabled !== false && e.localPath && mount && !mount.exists;
-    });
-    dot.className = missing.length ? 'dot down' : 'dot ok';
-    text.textContent = missing.length
-      ? `Local server running on ${LOCAL_ORIGIN} — folder not found: ${missing.map(e => e.localPath).join(', ')}`
-      : `Local server running on ${LOCAL_ORIGIN}`;
+  const allowed = await fileAccessAllowed();
+  if (allowed) {
+    dot.className = 'dot ok';
+    text.textContent = 'Map Local files are served straight from disk (file access allowed).';
+    banner.classList.remove('action');
   } else {
     dot.className = 'dot down';
-    text.textContent = `Local server not running — run "npm run install-service" once in the extension folder`;
+    text.textContent = 'Map Local needs "Allow access to file URLs": click here to open the extension details and turn it on.';
+    banner.classList.add('action');
+  }
+  await refreshFolderChecks();
+}
+
+// A folder cannot be probed from here (Chrome only lists file:// directories on navigation), so show what
+// the worker actually did with each rule since it started: last file served, or last file it could not find
+async function refreshFolderChecks() {
+  let stats = {};
+  try {
+    stats = (await chrome.runtime.sendMessage({ action: 'getMapLocalStats' })) || {};
+  } catch { /* worker asleep: nothing to show */ }
+  for (const entry of settings.mapLocal) {
+    const card = mapLocalList.querySelector(`[data-id="${entry.id}"]`);
+    const note = card?.querySelector('.folder-note');
+    if (!note) continue;
+    const last = stats[entry.id]?.last;
+    note.classList.toggle('ok', !!last?.ok);
+    if (!last) { note.textContent = ''; continue; }
+    const rel = decodeURIComponent(last.url.replace(/^file:\/\//, ''));
+    note.textContent = last.ok
+      ? `Last served: ${rel}`
+      : `Last file not found: ${rel} (request went to the real site)`;
   }
 }
 
 function renderMapLocal() {
   mapLocalList.textContent = '';
-  healthListeners.clear();
-  healthListeners.add(renderServerBanner);
 
   if (!settings.mapLocal.length) {
     mapLocalList.innerHTML = '<p class="empty">No map-local rules.</p>';
@@ -138,13 +148,17 @@ function renderMapLocal() {
 
   for (const entry of settings.mapLocal) {
     const { card, fields } = cardShell(entry, settings.mapLocal, renderMapLocal);
+    const note = document.createElement('div');
+    note.className = 'folder-note wide';
     fields.append(
       textField('URL pattern', entry, 'pattern', { placeholder: 'https://*/view/orion/*', wide: true }),
-      textField('Local folder', entry, 'localPath', { placeholder: '/path/to/static', wide: true }),
+      textField('Local folder', entry, 'localPath', { placeholder: '/path/to/static', wide: true, onInput: () => { note.textContent = ''; } }),
+      note,
       modesField(entry)
     );
     mapLocalList.appendChild(card);
   }
+  refreshFolderChecks();
 }
 
 function renderRewrites() {
@@ -236,20 +250,23 @@ async function save() {
       replacement: e.replacement.trim(), modes: e.modes
     }))
   };
-  await chrome.storage.local.set({ [SETTINGS_KEY]: clean });
+  try {
+    // Background re-syncs interception on the storage change; nothing else to notify
+    await DevModeConfig.writeSettings(clean);
+  } catch (err) {
+    // Chrome sync quota (8 KB per rule, 100 KB total, 120 writes/min) or sync unavailable
+    setStatus(`Not saved: ${err?.message || err}`, 'err');
+    return;
+  }
   settings = structuredClone(clean);
-  // Background pushes the folders to the server on storage change; wait for it, then refresh status
-  await chrome.runtime.sendMessage({ action: 'pushServerConfig' }).catch(() => {});
-  await pollHealth();
-  setStatus(serverHealth ? 'Saved. Rules and server updated.' : 'Saved. Rules updated (server not running).', serverHealth ? 'ok' : '');
+  await refreshFolderChecks();
+  setStatus('Saved. Rules sync to your other Chrome profiles through your Google account.', 'ok');
   setTimeout(() => setStatus(''), 3000);
 }
 
 async function load() {
-  const { [SETTINGS_KEY]: stored } = await chrome.storage.local.get(SETTINGS_KEY);
-  settings = stored?.mapLocal && stored?.rewrites
-    ? structuredClone(stored)
-    : await chrome.runtime.sendMessage({ action: 'getDefaultSettings' });
+  const { mapLocal, rewrites } = await DevModeConfig.readConfig();
+  settings = { mapLocal, rewrites };
   renderAll();
 }
 
@@ -265,13 +282,25 @@ document.getElementById('add-rewrite').addEventListener('click', () => {
   rewriteList.lastElementChild?.querySelector('input[type="text"]')?.focus();
 });
 
-document.getElementById('restore').addEventListener('click', async () => {
-  settings = await chrome.runtime.sendMessage({ action: 'getDefaultSettings' });
+document.getElementById('restore').addEventListener('click', () => {
+  settings = DevModeConfig.defaults();
   renderAll();
   setStatus('Defaults restored — click Save to apply.');
 });
 
 document.getElementById('save').addEventListener('click', save);
 
-load().then(pollHealth);
-setInterval(pollHealth, 4000);
+document.getElementById('file-access-banner').addEventListener('click', () => {
+  chrome.runtime.sendMessage({ action: 'openExtensionDetails' });
+});
+
+// Edits arriving from another machine (or the popup's globals) re-render when nothing is being typed
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync' || !Object.keys(changes).some(DevModeConfig.isRuleKey)) return;
+  if (document.activeElement?.tagName === 'INPUT') return;
+  load();
+});
+
+load().then(renderFileAccessBanner);
+// The toggle lives on the extension card; re-check when the user comes back to this tab
+document.addEventListener('visibilitychange', () => { if (!document.hidden) renderFileAccessBanner(); });

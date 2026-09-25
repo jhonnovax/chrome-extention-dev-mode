@@ -1,12 +1,12 @@
+// Rules + globals live in chrome.storage.sync (see sync-schema.js); modes stay in chrome.storage.local
+importScripts('sync-schema.js');
+
 // Constants
 const COOKIE_NAME = 'htm-dev-mode';
 const COOKIE_VALUE = '4815162342';
 const STORAGE_KEY = 'domainStates';
-const SETTINGS_KEY = 'settings';
-const GLOBALS_KEY = 'globals';
-const LOCAL_HOST = '127.0.0.1';
-const LOCAL_PORT = 4815;
-const LOCAL_ORIGIN = `http://${LOCAL_HOST}:${LOCAL_PORT}`;
+const LEGACY_SETTINGS_KEY = 'settings'; // chrome.storage.local keys used before 1.4 (migrated to sync once)
+const LEGACY_GLOBALS_KEY = 'globals';
 const DEBUGGER_VERSION = '1.3';
 
 const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview' };
@@ -18,22 +18,33 @@ const STATE_CONFIG = {
   [STATES.PREVIEW]: { color: '#EAB308', label: 'PRE', badgeBgLight: 'rgba(234,179,8,0.18)',   badgeTextLight: '#a16207', badgeBgDark: 'rgba(234,179,8,0.24)',   badgeTextDark: '#facc15', title: 'Preview Mode',     cookie: false, cache: false }
 };
 
-// Default map-local / rewrite rules seeded on first run (editable in options.html)
-const DEFAULT_SETTINGS = {
-  mapLocal: [{
-    id: 'ml-orion',
-    enabled: true,
-    pattern: 'https://*/view/orion/*',
-    localPath: '/Users/jnova/Projects/orion/static',
-    modes: [STATES.DEV, STATES.PREVIEW]
-  }],
-  rewrites: [{
-    id: 'rw-production-hash',
-    enabled: true,
-    regex: '/(.*)/dist/production-(css|js)-(.*).(css|js)(.*)',
-    replacement: '/$1/dist/production-$2.$4',
-    modes: [STATES.PREVIEW]
-  }]
+// Content-Type for files served from disk (Chrome gives file:// responses no reliable type)
+const MIME = {
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.eot': 'application/vnd.ms-fontobject',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wasm': 'application/wasm'
 };
 
 const ALL_RESOURCE_TYPES = [
@@ -118,28 +129,58 @@ async function saveState(domain, state) {
   await chrome.storage.local.set({ [STORAGE_KEY]: states });
 }
 
-// Get settings, seeding defaults when missing (first install or upgrade)
-async function getSettings() {
-  const { [SETTINGS_KEY]: settings } = await chrome.storage.local.get(SETTINGS_KEY);
-  if (settings && Array.isArray(settings.mapLocal) && Array.isArray(settings.rewrites)) return settings;
-  const seeded = structuredClone(DEFAULT_SETTINGS);
-  await chrome.storage.local.set({ [SETTINGS_KEY]: seeded });
-  return seeded;
+// ---- Config (chrome.storage.sync via sync-schema.js), cached until the store changes ----
+
+let configCache = null;
+
+// { mapLocal, rewrites, globals } — defaults when the sync store was never written
+async function getConfig() {
+  if (!configCache) configCache = DevModeConfig.readConfig();
+  try {
+    return await configCache;
+  } catch (err) {
+    configCache = null;
+    throw err;
+  }
+}
+
+const getSettings = getConfig;
+
+function invalidateConfig() {
+  configCache = null;
+}
+
+// One-time move of the pre-1.4 chrome.storage.local rules/globals into the sync store.
+// Only runs when the cloud store is still empty, so cloud data always wins over local leftovers.
+async function migrateLocalConfig() {
+  const local = await chrome.storage.local.get([LEGACY_SETTINGS_KEY, LEGACY_GLOBALS_KEY]);
+  const legacySettings = local[LEGACY_SETTINGS_KEY];
+  const legacyGlobals = local[LEGACY_GLOBALS_KEY];
+  if (!legacySettings && !legacyGlobals) return;
+
+  const all = await chrome.storage.sync.get(null);
+  if (!all[DevModeConfig.META_KEY]) {
+    if (legacySettings?.mapLocal && legacySettings?.rewrites) await DevModeConfig.writeSettings(legacySettings);
+    for (const [domain, list] of Object.entries(legacyGlobals || {})) {
+      if (Array.isArray(list) && list.length) await DevModeConfig.writeGlobals(domain, list);
+    }
+    console.info('[Dev Mode] migrated local rules/globals to chrome.storage.sync');
+  }
+  await chrome.storage.local.remove([LEGACY_SETTINGS_KEY, LEGACY_GLOBALS_KEY]);
+  invalidateConfig();
 }
 
 // ---- Global variable overrides (per root domain, injected in DEV/PREVIEW only) ----
-// Stored as { '.on24.com': [{ name, value }] } with `value` the raw string typed in the popup
+// Stored in sync as 'globals:<domain>' → [{ name, value }] with `value` the raw string typed in the popup
 
 async function getGlobals(domain) {
-  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
-  return Array.isArray(all[domain]) ? all[domain] : [];
+  const { globals } = await getConfig();
+  return Array.isArray(globals[domain]) ? globals[domain] : [];
 }
 
 async function saveGlobals(domain, list) {
-  const { [GLOBALS_KEY]: all = {} } = await chrome.storage.local.get(GLOBALS_KEY);
-  if (list.length) all[domain] = list;
-  else delete all[domain];
-  await chrome.storage.local.set({ [GLOBALS_KEY]: all });
+  await DevModeConfig.writeGlobals(domain, list);
+  invalidateConfig();
 }
 
 // chrome.userScripts is only exposed while the "Allow User Scripts" toggle is on (Chrome 138+)
@@ -239,36 +280,71 @@ function applyRewrites(url, settings, state) {
   return current;
 }
 
-// First map-local rule matching the URL -> local server URL (/m/<ruleId>/<last wildcard>) or null
+// First map-local rule matching the URL -> file:// URL under the rule's folder, or null.
+// The last wildcard of the pattern is the path under the folder (as in the local-server days).
 function mapLocalTarget(url, settings, state) {
   const bare = url.split(/[?#]/)[0];
   for (const ml of enabledFor(settings.mapLocal, state)) {
-    if (!ml.pattern || !ml.id) continue;
+    if (!ml.pattern || !ml.localPath) continue;
     const { regex, groups } = globToRegex(ml.pattern);
     let match;
     try { match = bare.match(new RegExp(regex, 'i')); } catch { continue; }
     if (!match) continue;
-    return `${LOCAL_ORIGIN}/m/${ml.id}/` + (groups ? match[groups] : '');
+    const url = fileUrlFor(ml.localPath, groups ? match[groups] : '');
+    return url ? { url, id: ml.id } : null;
   }
   return null;
 }
 
-// Tell the local server which folders to serve (all enabled map-local rules, any mode)
-async function pushServerConfig() {
-  const settings = await getSettings();
-  const mounts = {};
-  for (const e of settings.mapLocal) {
-    if (e.enabled !== false && e.id && e.localPath) mounts[e.id] = e.localPath;
-  }
+// Per-rule outcome of the last mappings since the worker started (shown in the options page):
+// { [ruleId]: { served, missing, last: { ok, url, at } } }
+const mapLocalStats = {};
+function recordMapLocal(id, ok, url) {
+  const s = mapLocalStats[id] || (mapLocalStats[id] = { served: 0, missing: 0, last: null });
+  ok ? s.served++ : s.missing++;
+  s.last = { ok, url, at: Date.now() };
+}
+
+// file:///<folder>/<relPath>; directories get index.html; anything escaping the folder is refused
+function fileUrlFor(folder, relPath) {
+  const root = 'file://' + encodeURI(folder.replace(/\/+$/, '')) + '/';
+  let rel = String(relPath || '').replace(/^\/+/, '');
+  if (!rel || rel.endsWith('/')) rel += 'index.html';
   try {
-    await fetch(`${LOCAL_ORIGIN}/__config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mounts })
-    });
+    const target = new URL(rel, root);
+    if (target.protocol !== 'file:' || !target.pathname.startsWith(new URL(root).pathname)) return null;
+    return target.href;
   } catch {
-    // server not running; it will get the config on the next save / startup
+    return null;
   }
+}
+
+function contentTypeFor(fileUrl, fallback) {
+  const path = new URL(fileUrl).pathname;
+  const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
+  return MIME[ext] || fallback || 'application/octet-stream';
+}
+
+// "Allow access to file URLs" toggle on the extension card (chrome://extensions → Dev Mode → Details).
+// When the API is not exposed to the worker the answer is "unknown" → assume allowed and let the fetch decide
+// (the popup checks the toggle itself, extension pages always have chrome.extension).
+let fileAccessCache = { value: null, at: 0 };
+async function fileAccessAllowed() {
+  if (Date.now() - fileAccessCache.at < 5_000 && fileAccessCache.value !== null) return fileAccessCache.value;
+  let value = true;
+  try {
+    if (typeof chrome.extension?.isAllowedFileSchemeAccess === 'function') {
+      value = await chrome.extension.isAllowedFileSchemeAccess();
+    }
+  } catch { /* unknown: keep true */ }
+  fileAccessCache = { value, at: Date.now() };
+  return value;
+}
+
+// Does the given state rely on any map-local rule?
+async function usesMapLocal(state) {
+  const settings = await getSettings();
+  return enabledFor(settings.mapLocal, state).some(e => e.pattern && e.localPath);
 }
 
 // ---- Request interception (chrome.debugger + Fetch domain) ----
@@ -452,26 +528,33 @@ async function onRequestPaused(tabId, params) {
     if (state === STATES.OFF) return finish('Fetch.continueRequest');
 
     const rewritten = applyRewrites(request.url, settings, state);
-    const local = mapLocalTarget(rewritten, settings, state);
+    const hit = mapLocalTarget(rewritten, settings, state);
+    const local = hit?.url || null;
     const isDocument = params.resourceType === 'Document';
     if (isDocument || local || rewritten !== request.url) {
       console.info(`[Dev Mode] ${params.resourceType} ${request.url} (${state}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
     }
 
     if (local) {
+      if (!(await fileAccessAllowed())) {
+        if (!warnedUrls.has('file-access')) {
+          warnedUrls.add('file-access');
+          console.warn('[Dev Mode] Map Local needs "Allow access to file URLs": enable it in the extension details (chrome://extensions → Dev Mode → Details). Serving from the real site.');
+        }
+        return finish('Fetch.continueRequest');
+      }
+      warnedUrls.delete('file-access');
+
+      // A missing file rejects the fetch (file:// has no 404); a directory answers Chrome's listing page
       let res = null;
       try {
         res = await fetch(local, { cache: 'no-store' });
-      } catch {
-        if (!warnedUrls.has('server')) {
-          warnedUrls.add('server');
-          console.warn('[Dev Mode] Local server not reachable; serving from the real site. Run "npm run install-service" once.');
-        }
-      }
+      } catch { /* no such file */ }
+      recordMapLocal(hit.id, !!res?.ok, local);
       if (res?.ok) {
         const body = toBase64(await res.arrayBuffer());
         const responseHeaders = [
-          { name: 'Content-Type', value: res.headers.get('content-type') || 'application/octet-stream' },
+          { name: 'Content-Type', value: contentTypeFor(local, res.headers.get('content-type')) },
           { name: 'Cache-Control', value: 'no-store' },
           { name: 'X-Dev-Mode', value: 'map-local' }
         ];
@@ -481,9 +564,9 @@ async function onRequestPaused(tabId, params) {
         }
         return finish('Fetch.fulfillRequest', { responseCode: 200, responseHeaders, body });
       }
-      if (res && (isDocument || !warnedUrls.has(rewritten))) {
+      if (isDocument || !warnedUrls.has(rewritten)) {
         warnedUrls.add(rewritten);
-        console.warn(`[Dev Mode] No local file for ${rewritten} (${res.status}); serving ${request.url} from the real site.`);
+        console.warn(`[Dev Mode] No local file ${local}; serving ${request.url} from the real site.`);
       }
       // The rewrite existed to reach the local file; without it, ask the real site for the original URL
       return finish('Fetch.continueRequest');
@@ -565,7 +648,8 @@ async function syncGlobals() {
   }
   warnedUserScripts = false;
 
-  const { [GLOBALS_KEY]: all = {}, [STORAGE_KEY]: states = {} } = await chrome.storage.local.get([GLOBALS_KEY, STORAGE_KEY]);
+  const { globals: all } = await getConfig();
+  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
   const scripts = [];
   const paused = [];
   for (const [rawDomain, list] of Object.entries(all)) {
@@ -629,13 +713,6 @@ async function setGlobals(list) {
   return { success: true, globals: clean };
 }
 
-// Ports the given state relies on: [LOCAL_PORT] when any map-local rule is active, else []
-async function localPortsForState(state) {
-  const settings = await getSettings();
-  const uses = enabledFor(settings.mapLocal, state).some(e => e.pattern);
-  return uses ? [LOCAL_PORT] : [];
-}
-
 // Get active tab's state and update icon
 async function updateIconForActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -692,7 +769,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
       respond({
         state,
         domain,
-        ports: await localPortsForState(state),
+        usesMapLocal: await usesMapLocal(state),
+        fileAccess: await fileAccessAllowed(),
         globals: domain ? await getGlobals(domain) : [],
         userScripts: userScriptsAvailable()
       });
@@ -707,26 +785,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` }).then(() => respond({ ok: true }));
     return true;
   }
-  if (msg.action === 'getDefaultSettings') {
-    respond(structuredClone(DEFAULT_SETTINGS));
+  if (msg.action === 'getMapLocalStats') {
+    respond(mapLocalStats);
     return false;
-  }
-  if (msg.action === 'pushServerConfig') {
-    pushServerConfig().then(() => respond({ ok: true }));
-    return true;
   }
 });
 
-// Rules and interception derive from storage: rebuild whenever states or settings change
+// Interception, no-cache rules and globals derive from storage: rebuild whenever it changes.
+// 'local' holds the modes (domainStates); 'sync' holds rules and globals, and fires for edits made
+// here as well as for changes arriving from another machine through Chrome sync.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local') return;
-  if (changes[STORAGE_KEY] || changes[SETTINGS_KEY]) {
+  if (area === 'local' && changes[STORAGE_KEY]) {
     scheduleSync();
     ensureReady().then(syncAllTabs);
+    // Globals depend on the domain state too (not injected while OFF)
+    scheduleGlobalsSync();
+    return;
   }
-  if (changes[SETTINGS_KEY]) pushServerConfig();
-  // Globals depend on the domain state too (not injected while OFF)
-  if (changes[GLOBALS_KEY] || changes[STORAGE_KEY]) scheduleGlobalsSync();
+  if (area !== 'sync') return;
+  invalidateConfig();
+  const keys = Object.keys(changes);
+  if (keys.some(DevModeConfig.isRuleKey)) ensureReady().then(syncAllTabs);
+  if (keys.some(DevModeConfig.isGlobalsKey)) scheduleGlobalsSync();
 });
 
 // Apply cookie at multiple points to ensure it's set before request goes out
@@ -794,9 +874,10 @@ function init() {
   updateIconForActiveTab();
   scheduleSync();
   scheduleGlobalsSync();
-  pushServerConfig();
   ensureReady();
 }
-chrome.runtime.onInstalled.addListener(init);
+chrome.runtime.onInstalled.addListener(() => {
+  migrateLocalConfig().catch(err => console.error('[Dev Mode] migration failed', err)).then(init);
+});
 chrome.runtime.onStartup.addListener(init);
 init();

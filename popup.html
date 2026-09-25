@@ -218,8 +218,8 @@
       height: 16px;
     }
 
-    /* Local server status */
-    .server-status {
+    /* File access hint (Map Local reads files from disk) */
+    .file-access {
       display: flex;
       align-items: center;
       gap: 8px;
@@ -231,9 +231,9 @@
       cursor: pointer;
     }
 
-    .server-status[hidden] { display: none; }
+    .file-access[hidden] { display: none; }
 
-    .server-status .dot {
+    .file-access .dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
@@ -241,12 +241,12 @@
       flex-shrink: 0;
     }
 
-    .server-status.ok .dot { background: #00C853; box-shadow: 0 0 5px #00C853; }
-    .server-status.down .dot { background: #D32F2F; box-shadow: 0 0 5px #D32F2F; }
-    .server-status.down { color: #c62828; }
+    .file-access.ok .dot { background: #00C853; box-shadow: 0 0 5px #00C853; }
+    .file-access.down .dot { background: #D32F2F; box-shadow: 0 0 5px #D32F2F; }
+    .file-access.down { color: #c62828; }
 
     @media (prefers-color-scheme: dark) {
-      .server-status.down { color: #ef9a9a; }
+      .file-access.down { color: #ef9a9a; }
     }
 
     /* Global variable overrides (per domain, injected in DEV/PREVIEW) */
@@ -452,7 +452,7 @@
       <button type="submit" class="btn add" title="Add variable">+</button>
     </form>
   </div>
-  <div class="server-status" id="server-status" hidden title="Open settings">
+  <div class="file-access" id="file-access" hidden title="Open extension details">
     <span class="dot"></span>
     <span class="text"></span>
   </div>

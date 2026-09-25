@@ -1,28 +1,18 @@
-const serverStatus = document.getElementById('server-status');
+const fileAccessEl = document.getElementById('file-access');
 
-// Show whether the local map-local server(s) the current mode relies on are reachable
-async function updateServerStatus(ports = []) {
-  if (!ports.length) {
-    serverStatus.hidden = true;
-    return;
-  }
-
-  const results = await Promise.all(ports.map(async (port) => {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/__health`, { cache: 'no-store' });
-      return { port, ok: res.ok };
-    } catch {
-      return { port, ok: false };
-    }
-  }));
-
-  const down = results.filter(r => !r.ok).map(r => `:${r.port}`);
-  serverStatus.hidden = false;
-  serverStatus.classList.toggle('ok', down.length === 0);
-  serverStatus.classList.toggle('down', down.length > 0);
-  serverStatus.querySelector('.text').textContent = down.length
-    ? `Local server ${down.join(', ')} not running`
-    : `Local server ${results.map(r => `:${r.port}`).join(', ')} running`;
+// Map Local reads files straight from disk: warn when the mode uses it but file access is off.
+// The toggle is checked here (extension page) rather than trusting the worker, which may lack chrome.extension.
+async function updateFileAccess({ usesMapLocal = false } = {}) {
+  let fileAccess = true;
+  try {
+    fileAccess = await chrome.extension.isAllowedFileSchemeAccess();
+  } catch { /* unknown: stay quiet */ }
+  const show = usesMapLocal && !fileAccess;
+  fileAccessEl.hidden = !show;
+  fileAccessEl.classList.toggle('down', show);
+  fileAccessEl.querySelector('.text').textContent = show
+    ? 'Map Local needs “Allow access to file URLs” — click to open extension details'
+    : '';
 }
 
 // ---- Global variable overrides (per domain, any mode) ----
@@ -118,7 +108,7 @@ async function updateUI() {
     item.classList.toggle('active', item.dataset.state === currentState);
   });
 
-  updateServerStatus(response?.ports);
+  updateFileAccess(response);
   renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts, state: currentState });
 }
 
@@ -164,8 +154,8 @@ document.getElementById('settings').addEventListener('click', () => {
   window.close();
 });
 
-serverStatus.addEventListener('click', () => {
-  chrome.runtime.openOptionsPage();
+fileAccessEl.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ action: 'openExtensionDetails' });
   window.close();
 });
 

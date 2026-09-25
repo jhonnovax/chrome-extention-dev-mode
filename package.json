@@ -1,11 +1,6 @@
 {
   "name": "dev-mode-extension",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "private": true,
-  "description": "Chrome extension: DEV mode cookie, map-local and rewrite rules. `npm run serve` starts the local static server used by map-local rules.",
-  "scripts": {
-    "serve": "node local-server/serve.js",
-    "install-service": "bash local-server/install-launchd.sh",
-    "uninstall-service": "bash local-server/install-launchd.sh --uninstall"
-  }
+  "description": "Chrome extension: DEV mode cookie, map-local (served straight from disk) and rewrite rules, global overrides; rules and globals sync through chrome.storage.sync."
 }

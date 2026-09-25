@@ -105,6 +105,11 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); opacity: 0.5; display: inline-block; }
     .dot.ok { background: var(--ok); opacity: 1; box-shadow: 0 0 6px var(--ok); }
     .dot.down { background: var(--danger); opacity: 1; }
+    .banner.action { cursor: pointer; color: var(--danger); }
+    .banner.action:hover { text-decoration: underline; }
+    .folder-note { color: var(--danger); font-size: 12px; word-break: break-all; }
+    .folder-note.ok { color: var(--text-secondary); }
+    .folder-note:empty { display: none; }
 
     .error { grid-column: 1 / -1; color: var(--danger); font-size: 12px; }
     .error:empty { display: none; }
@@ -146,7 +151,12 @@
   <main>
     <h1>Dev Mode Settings</h1>
     <p class="subtitle">Rules are applied per mode on the domains where a mode is active. Changes take effect on save without reloading the extension.</p>
-    <div class="banner" id="server-banner"><span class="dot"></span><span class="text">Checking local server…</span></div>
+    <p class="hint">
+      Rules and globals are stored in Chrome sync, so they follow your Google account to every Chrome profile where
+      this extension is loaded (Chrome sync must include <strong>Extensions</strong>; otherwise they stay on this machine).
+      Modes (Off / Dev / Preview) are per machine.
+    </p>
+    <div class="banner" id="file-access-banner"><span class="dot"></span><span class="text">Checking file access…</span></div>
 
     <section>
       <div class="section-head">
@@ -154,8 +164,10 @@
         <button class="small" id="add-map-local">+ Add</button>
       </div>
       <p class="hint">
-        Redirects matching requests to a local folder. Use <code>*</code> as wildcard; the last wildcard becomes the
-        path under the folder. Folders are sent to the local server automatically when you save.
+        Answers matching requests with a file from a local folder. Use <code>*</code> as wildcard; the last wildcard becomes the
+        path under the folder (a folder path serves its <code>index.html</code>). Files are read straight from disk, which needs
+        <strong>Allow access to file URLs</strong> on the extension card. Under each folder you see the last file the rule
+        served or failed to find since Chrome started.
       </p>
       <p class="hint">
         While Development or Preview is active, Chrome shows a <em>"Dev Mode started debugging this browser"</em> bar on
@@ -186,6 +198,7 @@
     </div>
   </footer>
 
+  <script src="sync-schema.js"></script>
   <script src="options.js"></script>
 </body>
 </html>
