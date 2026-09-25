@@ -106,6 +106,12 @@
     .dot.ok { background: var(--ok); opacity: 1; box-shadow: 0 0 6px var(--ok); }
     .dot.down { background: var(--danger); opacity: 1; }
     .banner.action { cursor: pointer; color: var(--danger); }
+    .activity {
+      font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.5;
+      background: var(--bg-card); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px;
+      max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+    }
+    .activity .warn { color: var(--danger); }
     .banner.action:hover { text-decoration: underline; }
     .folder-note { color: var(--danger); font-size: 12px; word-break: break-all; }
     .folder-note.ok { color: var(--text-secondary); }
@@ -187,6 +193,23 @@
         Rewrites run before Map Local, so a rewritten URL can then be mapped locally.
       </p>
       <div id="rewrite-list"></div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Activity</h2>
+        <span>
+          <button class="small" id="activity-copy">Copy</button>
+          <button class="small" id="activity-refresh">Refresh</button>
+        </span>
+      </div>
+      <p class="hint">
+        What the extension did since Chrome started: tabs it debugs, the URL patterns it intercepts, and for each
+        intercepted request where it was served from. Refreshes every 2 s while this page is visible. If something is
+        not mapped, look for its URL here: no line means the request never reached the interception.
+      </p>
+      <pre id="activity-summary" class="activity"></pre>
+      <pre id="activity-log" class="activity"></pre>
     </section>
   </main>
 

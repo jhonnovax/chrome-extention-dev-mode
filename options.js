@@ -301,6 +301,50 @@ chrome.storage.onChanged.addListener((changes, area) => {
   load();
 });
 
-load().then(renderFileAccessBanner);
+// ---- activity log (the worker's "[Dev Mode]" lines, kept in memory by the service worker) ----
+
+let activityText = '';
+
+async function renderActivity() {
+  const summary = document.getElementById('activity-summary');
+  const logEl = document.getElementById('activity-log');
+  let data = null;
+  try {
+    data = await chrome.runtime.sendMessage({ action: 'getActivityLog' });
+  } catch { /* worker asleep */ }
+  if (!data) {
+    summary.textContent = 'Worker not running (it starts on the next navigation).';
+    return;
+  }
+  const modes = Object.entries(data.states || {}).map(([d, s]) => `${d}=${s}`).join(', ') || 'none';
+  const tabs = data.tabs.length
+    ? data.tabs.map(t => `  tab ${t.id} ${t.url}\n    iframes attached: ${t.iframes} · patterns: ${t.patterns.join(', ') || 'none'}`).join('\n')
+    : '  none';
+  summary.textContent = `modes: ${modes}\nfile access: ${data.fileAccess} · user scripts: ${data.userScripts}\ndebugged tabs:\n${tabs}`;
+
+  logEl.textContent = '';
+  for (const line of data.log) {
+    const span = document.createElement('span');
+    span.className = line.level === 'info' ? '' : 'warn';
+    span.textContent = `${new Date(line.at).toLocaleTimeString()} ${line.text}\n`;
+    logEl.appendChild(span);
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+  activityText = `${summary.textContent}\n\n${data.log.map(l => `${new Date(l.at).toISOString()} ${l.level} ${l.text}`).join('\n')}`;
+}
+
+document.getElementById('activity-refresh').addEventListener('click', renderActivity);
+document.getElementById('activity-copy').addEventListener('click', async () => {
+  await renderActivity();
+  try {
+    await navigator.clipboard.writeText(activityText);
+    setStatus('Activity copied to the clipboard.');
+  } catch {
+    setStatus('Could not copy: select the text and copy it manually.');
+  }
+});
+setInterval(() => { if (!document.hidden) renderActivity(); }, 2000);
+
+load().then(renderFileAccessBanner).then(renderActivity);
 // The toggle lives on the extension card; re-check when the user comes back to this tab
 document.addEventListener('visibilitychange', () => { if (!document.hidden) renderFileAccessBanner(); });

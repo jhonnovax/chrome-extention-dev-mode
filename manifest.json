@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Dev Mode",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Toggle DEV mode cookie, map-local (files served straight from disk) and rewrite rules, global variable overrides; config synced through your Google account",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApn8SpmMlVE3Brv8nml9t0JgrGvAGdKkEAzPJ14gMU6O5hwJNiYDIX6EfTa8Agyk1YSAHnrOhNfohOhVllM8QerNoJOaASglq2w65Tx/iEVUKPi5uQ+FJedrTvXPJ89SV3bKTDSmHIKB6oNuDKrnxY1HlXdqnmKjzhw/wozJjBFnSKcZzQBLFd+ToKPPFiZMzC6eM2JgTv24v9Lj9yHbbPoJBmTr+zZiApPX9s2pEwa5nSZe2Dus6UA8E5PuL6JcFnYgaqF1cjEpNLURxP+RgL+2vuoZ/nMalqDpI2t+JltyJI1zmxygHnJ2g6wqtiQAVN1vQ9sbgzjj4HrFejwrzfQIDAQAB",
   "permissions": [
@@ -10,6 +10,7 @@
     "declarativeNetRequest",
     "tabs",
     "webNavigation",
+    "scripting",
     "storage",
     "userScripts"
   ],

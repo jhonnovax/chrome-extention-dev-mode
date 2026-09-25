@@ -109,8 +109,33 @@ async function updateUI() {
   });
 
   updateFileAccess(response);
+  updateBlocked(response?.blockedBy || [], response?.interrupted);
   renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts, state: currentState });
 }
+
+// Chrome refuses to debug a tab that contains a frame of another extension: nothing works there until it is off
+let blockingExtension = null;
+// Another extension's frame (password managers such as iCloud Passwords inject one next to inputs)
+// makes Chrome end Dev Mode's debugging of the tab: nothing is mapped (blocked), or requests made
+// until the re-attach went to the real site (interrupted)
+function updateBlocked(ids, interrupted) {
+  const el = document.getElementById('blocked');
+  const culprits = ids.length ? ids : (interrupted?.ids || []);
+  blockingExtension = culprits[0] || null;
+  let text = '';
+  if (ids.length) {
+    text = `Chrome stopped Dev Mode on this tab: another extension (id ${ids.join(', ')}) put a frame in the page. Nothing here is mapped.`;
+  } else if (interrupted?.count) {
+    text = `Another extension${culprits.length ? ` (id ${culprits.join(', ')})` : ''} interrupted Dev Mode ${interrupted.count}× while this page loaded: some files came from the real site.`;
+  }
+  if (text) text += ' Click to open that extension and set Site access to "On click" (it stays installed and works when you click its icon), then reload.';
+  el.hidden = !text;
+  el.classList.toggle('down', !!text);
+  el.querySelector('.text').textContent = text;
+}
+document.getElementById('blocked').addEventListener('click', () => {
+  chrome.tabs.create({ url: blockingExtension ? `chrome://extensions/?id=${blockingExtension}` : 'chrome://extensions/' });
+});
 
 // Create ripple effect on click
 function createRipple(event, element) {

@@ -11,6 +11,25 @@ const DEBUGGER_VERSION = '1.3';
 
 const STATES = { OFF: 'off', DEV: 'dev', PREVIEW: 'preview' };
 
+// ---- Activity log: the worker's own "[Dev Mode]" console lines, readable from the options page ----
+// (the service worker console is hard to reach; the options page shows this buffer instead)
+const ACTIVITY_MAX = 400;
+const activityLog = [];
+for (const level of ['info', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    if (typeof args[0] === 'string' && args[0].startsWith('[Dev Mode]')) {
+      const text = args.map(a => (typeof a === 'string' ? a : (a?.message || safeJson(a)))).join(' ');
+      activityLog.push({ at: Date.now(), level, text: text.slice(0, 600) });
+      if (activityLog.length > ACTIVITY_MAX) activityLog.splice(0, activityLog.length - ACTIVITY_MAX);
+    }
+    original(...args);
+  };
+}
+function safeJson(value) {
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
 // badge*: exact popup badge CSS colors (light / dark variants)
 const STATE_CONFIG = {
   [STATES.OFF]:     { color: '#94A3B8', label: 'OFF', badgeBgLight: 'rgba(158,158,158,0.15)', badgeTextLight: '#5f6368', badgeBgDark: 'rgba(158,158,158,0.20)', badgeTextDark: '#bdbdbd', title: 'Off',              cookie: false, cache: true },
@@ -116,17 +135,31 @@ function extractDomain(url) {
   }
 }
 
+// domainStates, cached in memory (looked up for every intercepted request); invalidated on storage.onChanged
+let statesCache = null;
+function getStates() {
+  if (!statesCache) {
+    statesCache = chrome.storage.local.get(STORAGE_KEY).then(r => r[STORAGE_KEY] || {}).catch(() => ({}));
+  }
+  return statesCache;
+}
+
+function invalidateStates() {
+  statesCache = null;
+}
+
 // Get state for a domain
 async function getState(domain) {
-  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
+  const states = await getStates();
   return normalizeState(states[domain]);
 }
 
 // Save state for a domain
 async function saveState(domain, state) {
-  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
+  const states = { ...(await getStates()) };
   states[domain] = normalizeState(state);
   await chrome.storage.local.set({ [STORAGE_KEY]: states });
+  invalidateStates();
 }
 
 // ---- Config (chrome.storage.sync via sync-schema.js), cached until the store changes ----
@@ -201,15 +234,18 @@ function parseGlobalValue(raw) {
   }
 }
 
-// Snippet run in the page's MAIN world at document_start: each variable becomes a locked accessor
-// on window, so later assignments by page code are ignored and the override survives the page's life
-function buildGlobalsCode(list) {
+// [{ name, value }] -> { name: parsedValue }
+function parseGlobalVars(list) {
   const vars = {};
   for (const { name, value } of list) {
     if (typeof name === 'string' && name.trim()) vars[name.trim()] = parseGlobalValue(String(value ?? ''));
   }
-  return `(() => {
-  const vars = ${JSON.stringify(vars)};
+  return vars;
+}
+
+// Page-side snippet: each variable becomes a locked accessor on window, so later assignments by
+// page code are ignored and the override survives the page's life
+const DEFINE_GLOBALS_JS = `
   for (const key of Object.keys(vars)) {
     const value = vars[key];
     try {
@@ -217,7 +253,51 @@ function buildGlobalsCode(list) {
     } catch (e) {
       try { window[key] = value; } catch {}
     }
-  }
+  }`;
+
+// User script for one domain, run in the page's MAIN world at document_start. In an iframe it only
+// applies when the tab's top-level domain is active too (the tab's mode rules its frames).
+function buildGlobalsCode(list, activeDomains = []) {
+  return `(() => {
+  const vars = ${JSON.stringify(parseGlobalVars(list))};
+  const active = ${JSON.stringify(activeDomains)};
+  if (window !== window.top) {
+    let top = '';
+    try { top = window.top.location.hostname; } catch (e) {}
+    try { const a = location.ancestorOrigins; if (!top && a && a.length) top = new URL(a[a.length - 1]).hostname; } catch (e) {}
+    if (top && !active.includes('.' + top.split('.').slice(-2).join('.'))) return;
+  }${DEFINE_GLOBALS_JS}
+})();`;
+}
+
+// Script for Page.addScriptToEvaluateOnNewDocument: runs in every document of an attached target,
+// including about:blank / srcdoc / blob: iframes that user scripts cannot match, so it works out
+// the frame's root domain itself: from its origin, else from the nearest same-origin ancestor
+// (about:blank and srcdoc inherit the creator's origin), else from the referrer / embedding page.
+// The frame's list is injected when the tab's top-level domain is in `activeDomains` (the tab's mode rules its frames).
+function buildFrameGlobalsCode(byDomain, activeDomains) {
+  return `(() => {
+  const byDomain = ${JSON.stringify(byDomain)};
+  const active = ${JSON.stringify(activeDomains)};
+  const hostOf = (origin) => { try { return origin && origin !== 'null' ? new URL(origin).hostname : ''; } catch (e) { return ''; } };
+  const domainOf = (host) => host ? '.' + host.split('.').slice(-2).join('.') : '';
+  let host = '';
+  try {
+    let w = window;
+    for (let i = 0; i < 16 && !host; i++) {
+      host = hostOf(w.origin);
+      if (w === w.parent) break;
+      w = w.parent;
+    }
+  } catch (e) {}
+  if (!host) { try { host = hostOf(new URL(document.referrer).origin); } catch (e) {} }
+  if (!host) { try { host = hostOf(location.ancestorOrigins && location.ancestorOrigins[0]); } catch (e) {} }
+  const domain = domainOf(host);
+  let topDomain = domain;
+  try { topDomain = domainOf(hostOf(window.top.origin)) || topDomain; } catch (e) {}
+  try { const a = location.ancestorOrigins; if (a && a.length) topDomain = domainOf(hostOf(a[a.length - 1])) || topDomain; } catch (e) {}
+  const vars = byDomain[domain];
+  if (!vars || !active.includes(topDomain)) return;${DEFINE_GLOBALS_JS}
 })();`;
 }
 
@@ -235,14 +315,25 @@ function updateIcon(state) {
   chrome.action.setTitle({ title });
 }
 
+// Site ("https://on24.com") of a URL, the form chrome.cookies partition keys use
+function siteOf(url) {
+  const domain = extractDomain(url);
+  return domain ? `https://${domain.slice(1)}` : null;
+}
+
 // Apply state configuration (cookie). Network rules are handled by syncRules() / interception.
-async function applyConfig(state, url) {
+// `topLevelSite`: site of the tab's top-level page when `url` is a document embedded in it. A
+// document of another site is a third party there, and Chrome's "block third-party cookies"
+// setting withholds the plain cookie from it; a partitioned (CHIPS) copy keyed by the embedding
+// site is still delivered, so both are set (and both removed when the mode has no cookie).
+async function applyConfig(state, url, topLevelSite) {
   const config = STATE_CONFIG[normalizeState(state)];
   const domain = url ? extractDomain(url) : null;
   if (!domain) return;
+  const partitionKey = topLevelSite && topLevelSite !== siteOf(url) ? { topLevelSite } : null;
 
   if (config.cookie) {
-    await chrome.cookies.set({
+    const cookie = {
       url, domain,
       name: COOKIE_NAME,
       value: COOKIE_VALUE,
@@ -250,9 +341,33 @@ async function applyConfig(state, url) {
       secure: true,
       sameSite: 'no_restriction',
       expirationDate: Math.floor(Date.now() / 1000) + 31536000
-    });
+    };
+    try {
+      await chrome.cookies.set(cookie);
+      if (partitionKey) await chrome.cookies.set({ ...cookie, partitionKey });
+    } catch (err) {
+      console.warn(`[Dev Mode] cannot set the ${COOKIE_NAME} cookie on ${domain}: ${err?.message}`);
+    }
   } else {
     await chrome.cookies.remove({ url, name: COOKIE_NAME }).catch(() => {});
+    await removePartitionedCookies(domain, siteOf(url));
+  }
+}
+
+// Partitioned copies are invisible to the plain remove(): drop every one that belongs to `domain`
+// (the domain went OFF) or that is keyed by `topLevelSite` (the embedding page went OFF, its iframes
+// would otherwise keep the mode of the previous state)
+async function removePartitionedCookies(domain, topLevelSite) {
+  let all = [];
+  try {
+    all = await chrome.cookies.getAll({ name: COOKIE_NAME, partitionKey: {} });
+  } catch { return; }
+  for (const c of all) {
+    if (!c.partitionKey?.topLevelSite) continue;
+    const ownDomain = ('.' + c.domain.replace(/^\./, '')).endsWith(domain);
+    if (!ownDomain && c.partitionKey.topLevelSite !== topLevelSite) continue;
+    const url = `https://${c.domain.replace(/^\./, '')}${c.path || '/'}`;
+    await chrome.cookies.remove({ url, name: COOKIE_NAME, partitionKey: c.partitionKey }).catch(() => {});
   }
 }
 
@@ -350,12 +465,23 @@ async function usesMapLocal(state) {
 // ---- Request interception (chrome.debugger + Fetch domain) ----
 // Like Charles: the page keeps the original URL/origin. Map Local answers the request with
 // the local file (Fetch.fulfillRequest); Rewrite changes the URL invisibly (Fetch.continueRequest).
+//
+// Frames: a cross-site iframe runs in its own renderer with its own DevTools target, invisible to
+// the tab's root session. The root session therefore auto-attaches iframe targets (flatten mode);
+// every child session gets the same Fetch patterns and the same globals script, and its events and
+// replies carry the child's sessionId. The mode of a request is the one of its frame's document
+// when that is not OFF (an on24 page embedded in a foreign site), otherwise the tab's (assets
+// served from CDNs, third-party iframes inside a DEV page).
 
 const attachedTabs = new Set();
-const tabStates = new Map(); // tabId -> state the interception was enabled with
+const tabStates = new Map();       // tabId -> state of the top-level document (may be OFF)
+const tabPatterns = new Map();     // tabId -> Fetch.enable patterns in force ([] = disabled)
+const childSessions = new Map();   // tabId -> Set<sessionId> of auto-attached iframe targets
 const userDetachedTabs = new Set();
 const warnedUrls = new Set();
 let keepAliveTimer = null;
+
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true };
 
 function updateKeepAlive() {
   if (attachedTabs.size && !keepAliveTimer) {
@@ -366,41 +492,230 @@ function updateKeepAlive() {
   }
 }
 
-function sendCommand(tabId, method, params) {
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+// sessionId undefined = the tab's root session, otherwise an auto-attached child (iframe) session
+function sendCommand(tabId, method, params, sessionId) {
+  const target = sessionId ? { tabId, sessionId } : { tabId };
+  return chrome.debugger.sendCommand(target, method, params);
 }
 
-// Fetch.enable patterns for a state: raw globs of map-local rules; '*' when any rewrite applies
-async function interceptPatterns(state) {
-  const settings = await getSettings();
-  let patterns = enabledFor(settings.mapLocal, state)
-    .filter(e => e.pattern)
-    .map(e => ({ urlPattern: e.pattern, requestStage: 'Request' }));
-  if (enabledFor(settings.rewrites, state).some(e => e.regex)) {
-    patterns = [{ urlPattern: '*', requestStage: 'Request' }];
+function childrenOf(tabId) {
+  let set = childSessions.get(tabId);
+  if (!set) childSessions.set(tabId, set = new Set());
+  return set;
+}
+
+// Drop everything remembered about a tab's debugger session
+function forgetTab(tabId) {
+  attachedTabs.delete(tabId);
+  tabStates.delete(tabId);
+  tabPatterns.delete(tabId);
+  childSessions.delete(tabId);
+  for (const key of frameGlobalsScripts.keys()) {
+    if (key === String(tabId) || key.startsWith(`${tabId}/`)) frameGlobalsScripts.delete(key);
   }
-  return patterns;
+  updateKeepAlive();
 }
 
-async function enableInterception(tabId, state) {
-  tabStates.set(tabId, state);
-  const patterns = await interceptPatterns(state);
+// Fetch.enable patterns for a set of states: raw globs of map-local rules; '*' when any rewrite
+// applies. Documents (top and iframes) are always paused so the mode's cookie for their domain is
+// in place before the request leaves, whatever the rules.
+async function interceptPatterns(states) {
+  if (!states.length) return [];
+  const settings = await getSettings();
+  const globs = new Set();
+  for (const state of states) {
+    if (enabledFor(settings.rewrites, state).some(e => e.regex)) {
+      return [{ urlPattern: '*', requestStage: 'Request' }];
+    }
+    for (const e of enabledFor(settings.mapLocal, state)) if (e.pattern) globs.add(e.pattern);
+  }
+  return [
+    { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
+    ...[...globs].map(urlPattern => ({ urlPattern, requestStage: 'Request' }))
+  ];
+}
+
+async function applyPatterns(tabId, patterns, sessionId) {
   if (!patterns.length) {
-    await sendCommand(tabId, 'Fetch.disable').catch(() => {});
+    await sendCommand(tabId, 'Fetch.disable', undefined, sessionId).catch(() => {});
     return;
   }
-  await sendCommand(tabId, 'Fetch.enable', { patterns });
-  console.info(`[Dev Mode] interception on tab ${tabId} (${state}):`, patterns.map(p => p.urlPattern).join(', '));
+  await sendCommand(tabId, 'Fetch.enable', { patterns }, sessionId);
+}
+
+// Chrome's refusal to debug a tab holding another extension's frame; reported once by reportBlockedTab
+const isForeignFrameError = (err) => /chrome-extension/i.test(err?.message || '');
+
+// Root session first (errors propagate), then every known child session
+async function enableInterception(tabId, states) {
+  const patterns = await interceptPatterns(states);
+  tabPatterns.set(tabId, patterns);
+  await applyPatterns(tabId, patterns);
+  // Cross-site iframes get their own sessions (Target.attachedToTarget). Idempotent, and re-sent on
+  // every sync so a session whose first attempt failed still gets it.
+  sendCommand(tabId, 'Target.setAutoAttach', AUTO_ATTACH).catch(err => {
+    if (!isForeignFrameError(err) && !/not attached/i.test(err?.message || '')) {
+      console.warn(`[Dev Mode] cannot auto-attach iframes of tab ${tabId}: ${err?.message}`);
+    }
+  });
+  for (const sessionId of childrenOf(tabId)) {
+    applyPatterns(tabId, patterns, sessionId).catch(err => {
+      if (/session with given id not found/i.test(err?.message || '')) childrenOf(tabId).delete(sessionId);
+      else console.warn(`[Dev Mode] Fetch.enable failed on an iframe of tab ${tabId}: ${err?.message}`);
+    });
+  }
+  console.info(`[Dev Mode] interception on tab ${tabId} (${states.join('+')}):`, patterns.map(p => p.urlPattern).join(', ') || 'none');
+}
+
+// DEV/PREVIEW run with caches off. The declarativeNetRequest no-cache headers only reach the HTTP
+// cache; the renderer's memory cache would still hand back assets fetched before the attach (the
+// un-intercepted first load) without any request, so interception would never see them. DevTools'
+// "Disable cache" (Network.setCacheDisabled, needs Network.enable) bypasses both for the session.
+async function disableCache(tabId, sessionId) {
+  try {
+    await sendCommand(tabId, 'Network.enable', undefined, sessionId);
+    await sendCommand(tabId, 'Network.setCacheDisabled', { cacheDisabled: true }, sessionId);
+  } catch (err) {
+    if (!isForeignFrameError(err)) console.warn(`[Dev Mode] cannot disable the cache on tab ${tabId}${sessionId ? ' (iframe)' : ''}: ${err?.message}`);
+  }
 }
 
 const attaching = new Map(); // tabId -> in-flight attach promise
+const blockedTabs = new Map(); // tabId -> ids of other extensions whose frames keep Chrome from debugging the tab
+const interruptedTabs = new Map(); // tabId -> { ids, count } sessions closed by another extension's frame since the last top-level navigation
+
+// Chrome refuses an extension debugger on a tab that holds a frame of another extension (password
+// managers, Grammarly… inject one next to text fields) and drops the session as soon as such a frame
+// appears. Nothing here can override that: the user must turn that extension off for the site.
+// webNavigation.getAllFrames hides other extensions' frames, so the page DOM is scanned instead
+// (open shadow roots included); debugger targets of type "other" are the fallback.
+async function foreignExtensionFrames(tabId) {
+  const ids = new Set();
+  const add = (url) => {
+    try {
+      const id = new URL(url).hostname;
+      if (id && id !== chrome.runtime.id) ids.add(id);
+    } catch { /* ignore */ }
+  };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => {
+      const out = [];
+      const walk = (root) => {
+        for (const el of root.querySelectorAll('iframe, frame, embed, object')) {
+          const src = el.src || el.data || '';
+          if (src.startsWith('chrome-extension://')) out.push(src);
+        }
+        for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+      };
+      walk(document);
+      return out;
+    }
+  }).catch(() => []);
+  for (const r of results || []) for (const src of r.result || []) add(src);
+  if (!ids.size) {
+    const targets = await chrome.debugger.getTargets().catch(() => []);
+    for (const t of targets) if (t.type === 'other' && t.url?.startsWith('chrome-extension://')) add(t.url);
+  }
+  return [...ids];
+}
+
+// ---- Frame guard (frame-guard.js): removes other extensions' frames from debugged tabs ----
+// Registered on every http(s) page while any mode is active; a page asks the worker at start
+// whether its tab is active, and the worker pushes the activation when it attaches a tab.
+// Two registrations: on pages (and frames) of domains in DEV/PREVIEW the guard starts synchronously
+// at document_start (frame-guard-now.js first); everywhere else it asks the worker whether its tab
+// is active (an on24 iframe inside an OFF page of another site attaches the tab later).
+const FRAME_GUARD_ID = 'frame-guard';
+const FRAME_GUARD_NOW_ID = 'frame-guard-now';
+
+async function syncFrameGuard() {
+  const states = await getStates();
+  const domains = Object.keys(states).filter(d => normalizeState(states[d]) !== STATES.OFF).map(d => d.replace(/^\./, '')).filter(Boolean);
+  const matches = domains.flatMap(d => [`*://*.${d}/*`, `*://${d}/*`]);
+  const common = { allFrames: true, runAt: 'document_start', persistAcrossSessions: true };
+  try {
+    const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [FRAME_GUARD_ID, FRAME_GUARD_NOW_ID] });
+    const ids = existing.map(s => s.id);
+    if (!domains.length) {
+      if (ids.length) await chrome.scripting.unregisterContentScripts({ ids });
+      return;
+    }
+    const now = existing.find(s => s.id === FRAME_GUARD_NOW_ID);
+    const sameMatches = now && JSON.stringify([...now.matches].sort()) === JSON.stringify([...matches].sort());
+    if (!sameMatches) {
+      if (now) await chrome.scripting.unregisterContentScripts({ ids: [FRAME_GUARD_NOW_ID] });
+      await chrome.scripting.registerContentScripts([{ id: FRAME_GUARD_NOW_ID, js: ['frame-guard-now.js', 'frame-guard.js'], matches, ...common }]);
+    }
+    if (!ids.includes(FRAME_GUARD_ID)) {
+      await chrome.scripting.registerContentScripts([{ id: FRAME_GUARD_ID, js: ['frame-guard.js'], matches: ['http://*/*', 'https://*/*'], ...common }]);
+    }
+    if (!sameMatches) console.info(`[Dev Mode] frame guard on: ${domains.join(', ')} (other extensions' frames are removed from debugged tabs)`);
+  } catch (err) {
+    console.warn(`[Dev Mode] frame guard registration failed: ${err?.message}`);
+  }
+}
+
+function activateFrameGuard(tabId) {
+  chrome.tabs.sendMessage(tabId, { action: 'frameGuard', active: true }).catch(() => {});
+}
+
+// Remove other extensions' frames from every frame of the tab right now (same rule as the guard)
+async function sweepForeignFrames(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: (own) => {
+      let n = 0;
+      const walk = (root) => {
+        for (const el of root.querySelectorAll('iframe, frame, embed, object')) {
+          const src = el.getAttribute('src') || el.getAttribute('data') || '';
+          if (src.startsWith('chrome-extension://') && !src.startsWith(own)) { el.remove(); n++; }
+        }
+        for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+      };
+      walk(document);
+      return n;
+    },
+    args: [`chrome-extension://${chrome.runtime.id}/`]
+  }).catch(() => {});
+}
+
+// Chrome closed the session because a foreign frame committed: remove it and attach again, quickly
+// (requests made meanwhile are not intercepted). Bounded per page load, see attachRetries.
+const attachRetries = new Map(); // tabId -> retries since the last top-level navigation
+function retryAttach(tabId) {
+  const n = attachRetries.get(tabId) || 0;
+  if (n >= 5) return;
+  attachRetries.set(tabId, n + 1);
+  setTimeout(async () => {
+    await sweepForeignFrames(tabId);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) await syncTab(tabId, tab.url);
+    if (attachedTabs.has(tabId)) {
+      console.warn(`[Dev Mode] tab ${tabId} attached again after another extension's frame closed the session; requests made in between were not intercepted — reload the page if it misbehaves`);
+    }
+  }, 150);
+}
+
+async function reportBlockedTab(tabId, reason) {
+  const ids = await foreignExtensionFrames(tabId);
+  const known = blockedTabs.get(tabId) || [];
+  blockedTabs.set(tabId, ids);
+  if (ids.length && ids.join() === known.join()) return;
+  if (ids.length) {
+    console.warn(`[Dev Mode] cannot debug tab ${tabId} (${reason}): it contains a frame from another extension (${ids.join(', ')}). Chrome forbids debugging such tabs; disable that extension for this site (chrome://extensions → its Details → Site access) and reload.`);
+  } else {
+    console.warn(`[Dev Mode] cannot debug tab ${tabId}: ${reason}`);
+  }
+}
 
 // Attach + enable interception. `reloadAfter`: the call comes from a navigation whose document
 // request may already be in flight, so reload once when this call performed a new attach.
-async function attachTab(tabId, state, { reloadAfter = false } = {}) {
+async function attachTab(tabId, states, { reloadAfter = false } = {}) {
   if (attachedTabs.has(tabId)) {
     try {
-      await enableInterception(tabId, state);
+      await enableInterception(tabId, states);
+      await installFrameGlobals(tabId);
       return;
     } catch {
       // Session is gone (worker restart, DevTools took over…) — attach again below
@@ -413,25 +728,30 @@ async function attachTab(tabId, state, { reloadAfter = false } = {}) {
   const job = (async () => {
     try {
       await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-      console.info(`[Dev Mode] attached tab ${tabId} (${state})`);
+      console.info(`[Dev Mode] attached tab ${tabId} (${states.join('+')})`);
     } catch (err) {
       // Already attached by us in a previous worker life, or not attachable (chrome://, another debugger)
       if (!/already attached/i.test(err?.message || '')) {
-        console.warn(`[Dev Mode] cannot attach tab ${tabId}: ${err?.message}`);
+        if (/chrome-extension/i.test(err?.message || '')) await reportBlockedTab(tabId, err.message);
+        else console.warn(`[Dev Mode] cannot attach tab ${tabId}: ${err?.message}`);
         return;
       }
       console.info(`[Dev Mode] tab ${tabId} already attached, reusing session`);
     }
+    blockedTabs.delete(tabId);
     attachedTabs.add(tabId);
+    activateFrameGuard(tabId);
     updateKeepAlive();
     try {
-      await enableInterception(tabId, state);
+      await enableInterception(tabId, states);
     } catch (err) {
       console.warn(`[Dev Mode] Fetch.enable failed on tab ${tabId}: ${err?.message}`);
       attachedTabs.delete(tabId);
       updateKeepAlive();
       return;
     }
+    await disableCache(tabId);
+    await installFrameGlobals(tabId);
     if (reloadAfter) {
       console.info(`[Dev Mode] reloading tab ${tabId} so the document is intercepted`);
       // Plain reload: a cache-bypassing reload makes some on24 pages answer 404
@@ -448,16 +768,46 @@ async function attachTab(tabId, state, { reloadAfter = false } = {}) {
 }
 
 // Always ask Chrome to detach: the in-memory set is lost when the service worker restarts,
-// but the debugger session is not, so it must not be the only source of truth
+// but the debugger session is not, so it must not be the only source of truth.
+// Detaching the root session also drops its auto-attached child sessions.
 async function detachTab(tabId) {
-  const known = attachedTabs.delete(tabId);
-  tabStates.delete(tabId);
-  updateKeepAlive();
+  const known = attachedTabs.has(tabId);
+  forgetTab(tabId);
   try {
     await chrome.debugger.detach({ tabId });
     console.info(`[Dev Mode] detached tab ${tabId}`);
   } catch (err) {
     if (known) console.warn(`[Dev Mode] detach tab ${tabId} failed: ${err?.message}`);
+  }
+}
+
+// A new iframe target (cross-site frame) was auto-attached: give it the tab's patterns and globals,
+// then let it run. It is paused until Runtime.runIfWaitingForDebugger, so that call always happens.
+async function onTargetAttached(tabId, params) {
+  const { sessionId, targetInfo, waitingForDebugger } = params;
+  const resume = () => (waitingForDebugger
+    ? sendCommand(tabId, 'Runtime.runIfWaitingForDebugger', undefined, sessionId).catch(() => {})
+    : Promise.resolve());
+  if (targetInfo?.type !== 'iframe') return resume();
+
+  childrenOf(tabId).add(sessionId);
+  attachedTabs.add(tabId);
+  updateKeepAlive();
+  console.info(`[Dev Mode] attached iframe ${targetInfo.url || '(no url)'} in tab ${tabId}`);
+  try {
+    // Interception first (the frame is still paused), then the rest
+    const patterns = tabPatterns.get(tabId) ?? await interceptPatterns(await tabStatesFor(tabId));
+    tabPatterns.set(tabId, patterns);
+    await applyPatterns(tabId, patterns, sessionId);
+    console.info(`[Dev Mode] interception on iframe of tab ${tabId}:`, patterns.map(p => p.urlPattern).join(', ') || 'none');
+    // Nested cross-site iframes hang off this session
+    await sendCommand(tabId, 'Target.setAutoAttach', AUTO_ATTACH, sessionId).catch(() => {});
+    await disableCache(tabId, sessionId);
+    await installFrameGlobals(tabId, sessionId);
+  } catch (err) {
+    console.warn(`[Dev Mode] iframe setup failed in tab ${tabId}: ${err?.message}`);
+  } finally {
+    await resume();
   }
 }
 
@@ -472,11 +822,24 @@ async function loadAttachedTabs() {
   updateKeepAlive();
 }
 
-// Attach or detach a tab according to the state of its current URL
-async function syncTab(tabId, url, options) {
-  const state = await stateForUrl(url);
-  if (state === STATES.OFF) await detachTab(tabId);
-  else await attachTab(tabId, state, options);
+// States a tab needs interception for. The mode picked for the tab's own (top-level) domain rules
+// everything the tab loads: CDN assets and iframes of other domains, whatever their own mode.
+// OFF on the tab means OFF inside its iframes too.
+async function tabStatesFor(tabId, topUrl) {
+  if (topUrl === undefined) topUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
+  const state = await stateForUrl(topUrl);
+  return state === STATES.OFF ? [] : [state];
+}
+
+// Attach or detach a tab according to the mode of its top-level URL
+async function syncTab(tabId, url, { reloadAfter = false } = {}) {
+  tabStates.set(tabId, await stateForUrl(url));
+  const states = await tabStatesFor(tabId, url);
+  if (!states.length) {
+    await detachTab(tabId);
+    return;
+  }
+  await attachTab(tabId, states, { reloadAfter });
 }
 
 // Re-evaluate every open tab (worker start, settings change)
@@ -492,6 +855,17 @@ function ensureReady() {
   return ready;
 }
 
+// Mode for a paused request: the tab's (see tabStatesFor)
+async function requestState(tabId) {
+  let state = tabStates.get(tabId);
+  if (!state) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    state = await stateForUrl(tab?.url);
+    tabStates.set(tabId, state);
+  }
+  return state;
+}
+
 function toBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = '';
@@ -502,10 +876,11 @@ function toBase64(buffer) {
   return btoa(binary);
 }
 
-async function onRequestPaused(tabId, params) {
+async function onRequestPaused(source, params) {
+  const { tabId, sessionId } = source;
   const { requestId, request } = params;
   const finish = (method, extra = {}) =>
-    sendCommand(tabId, method, { requestId, ...extra }).catch(() => {});
+    sendCommand(tabId, method, { requestId, ...extra }, sessionId).catch(() => {});
 
   // Events can arrive right after a worker restart, before the attached set is rebuilt
   attachedTabs.add(tabId);
@@ -517,22 +892,23 @@ async function onRequestPaused(tabId, params) {
   }
 
   try {
-    // The mode belongs to the page (tab), not to the request's host: assets may come from a CDN
-    let state = tabStates.get(tabId);
-    if (!state) {
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      state = await stateForUrl(tab?.url);
-      tabStates.set(tabId, state);
-    }
+    const isDocument = params.resourceType === 'Document';
+    const state = await requestState(tabId);
     const settings = await getSettings();
     if (state === STATES.OFF) return finish('Fetch.continueRequest');
+    // The mode's cookie for the document's own domain, before the request leaves: cookies are added
+    // by the network stack after interception, so an iframe from another domain (e.g. an on24 page
+    // embedded in a DEV tab of another site) is served in the tab's mode too
+    if (isDocument) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      await applyConfig(state, request.url, siteOf(tab?.url));
+    }
 
     const rewritten = applyRewrites(request.url, settings, state);
     const hit = mapLocalTarget(rewritten, settings, state);
     const local = hit?.url || null;
-    const isDocument = params.resourceType === 'Document';
     if (isDocument || local || rewritten !== request.url) {
-      console.info(`[Dev Mode] ${params.resourceType} ${request.url} (${state}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
+      console.info(`[Dev Mode] ${params.resourceType} ${request.url} (${state}${sessionId ? ', iframe' : ''}) → ${local || (rewritten !== request.url ? rewritten : 'real site')}`);
     }
 
     if (local) {
@@ -581,23 +957,49 @@ async function onRequestPaused(tabId, params) {
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (method === 'Fetch.requestPaused' && source.tabId != null) onRequestPaused(source.tabId, params);
+  const tabId = source.tabId;
+  if (tabId == null) return;
+  // Child sessions outlive the worker like the root one: learn them back from their events
+  if (source.sessionId) childrenOf(tabId).add(source.sessionId);
+  switch (method) {
+    case 'Fetch.requestPaused':
+      onRequestPaused(source, params);
+      break;
+    case 'Target.attachedToTarget':
+      onTargetAttached(tabId, params);
+      break;
+    case 'Target.detachedFromTarget':
+      childrenOf(tabId).delete(params.sessionId);
+      frameGlobalsScripts.delete(`${tabId}/${params.sessionId}`);
+      break;
+  }
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId == null) return;
   console.info(`[Dev Mode] Chrome detached tab ${source.tabId}: ${reason}`);
-  attachedTabs.delete(source.tabId);
-  tabStates.delete(source.tabId);
-  updateKeepAlive();
+  forgetTab(source.tabId);
   // User clicked "Cancel" on the debugging bar: leave the tab alone until it navigates again
   if (reason === 'canceled_by_user') userDetachedTabs.add(source.tabId);
+  // Chrome closes the session when a frame of another extension shows up in the tab
+  if (reason === 'target_closed') {
+    const tabId = source.tabId;
+    chrome.tabs.get(tabId)
+      .then(() => reportBlockedTab(tabId, 'session closed by Chrome'))
+      .then(() => {
+        const ids = blockedTabs.get(tabId) || [];
+        const prev = interruptedTabs.get(tabId);
+        interruptedTabs.set(tabId, { ids: ids.length ? ids : (prev?.ids || []), count: (prev?.count || 0) + 1 });
+        return retryAttach(tabId);
+      })
+      .catch(() => {});
+  }
 });
 
 // ---- declarativeNetRequest: no-cache headers for domains with cache disabled ----
 
 async function syncRules() {
-  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
+  const states = await getStates();
   const rules = [];
 
   for (const [rawDomain, rawState] of Object.entries(states)) {
@@ -633,12 +1035,85 @@ function scheduleSync() {
   return syncQueue;
 }
 
-// ---- userScripts: one MAIN-world document_start script per domain with global overrides ----
-// Independent of the debugger/Fetch path: injected in DEV and PREVIEW, paused (kept but not registered) in OFF.
+// ---- Globals injection ----
+// Two complementary paths, both injecting in DEV and PREVIEW only (variables are kept but not injected in OFF):
+//  1. chrome.userScripts: one MAIN-world document_start script per domain, matched on the frame URL
+//     (top pages and iframes whose URL is on the domain), independent of the debugger.
+//  2. Page.addScriptToEvaluateOnNewDocument on every attached session (tab root + auto-attached
+//     iframe targets): reaches about:blank / srcdoc / blob: iframes and cross-site iframes that the
+//     user script cannot match. Both define the same locked accessors, so double injection is harmless.
+
+const frameGlobalsScripts = new Map(); // 'tabId' | 'tabId/sessionId' -> Page script identifier
+let frameGlobalsSource; // undefined = not built yet, null = nothing to inject
+
+// Every domain's list goes in: the snippet injects a frame's list when the frame's domain or the
+// tab's top-level domain is in DEV/PREVIEW (an iframe follows the mode of the tab it is loaded in)
+async function getFrameGlobalsSource() {
+  if (frameGlobalsSource !== undefined) return frameGlobalsSource;
+  const { globals: all } = await getConfig();
+  const states = await getStates();
+  const byDomain = {};
+  for (const [rawDomain, list] of Object.entries(all)) {
+    if (!Array.isArray(list) || !list.length) continue;
+    const vars = parseGlobalVars(list);
+    if (Object.keys(vars).length) byDomain[rawDomain.startsWith('.') ? rawDomain : `.${rawDomain}`] = vars;
+  }
+  const active = Object.keys(states).filter(d => normalizeState(states[d]) !== STATES.OFF);
+  frameGlobalsSource = Object.keys(byDomain).length && active.length ? buildFrameGlobalsCode(byDomain, active) : null;
+  return frameGlobalsSource;
+}
+
+// (Re)install the frame globals script on one session (root when sessionId is undefined).
+// Idempotent, and the new script is added before the old one is removed: syncs run concurrently
+// with reloads, and a gap between remove and add would leave the frames created meanwhile without globals.
+async function installFrameGlobals(tabId, sessionId) {
+  const key = sessionId ? `${tabId}/${sessionId}` : String(tabId);
+  try {
+    const source = await getFrameGlobalsSource();
+    const previous = frameGlobalsScripts.get(key);
+    if (previous?.source === source) return;
+    if (source) {
+      // The script only runs while the Page domain is enabled on that session
+      await sendCommand(tabId, 'Page.enable', undefined, sessionId);
+      const { identifier } = await sendCommand(tabId, 'Page.addScriptToEvaluateOnNewDocument', { source, runImmediately: true }, sessionId);
+      frameGlobalsScripts.set(key, { identifier, source });
+    } else {
+      frameGlobalsScripts.delete(key);
+    }
+    if (previous) {
+      await sendCommand(tabId, 'Page.removeScriptToEvaluateOnNewDocument', { identifier: previous.identifier }, sessionId).catch(() => {});
+    }
+  } catch (err) {
+    // An iframe session that vanished before its Target.detachedFromTarget arrived
+    if (sessionId && /session with given id not found/i.test(err?.message || '')) {
+      childrenOf(tabId).delete(sessionId);
+      frameGlobalsScripts.delete(key);
+      return;
+    }
+    if (!isForeignFrameError(err)) console.warn(`[Dev Mode] globals script failed on tab ${tabId}${sessionId ? ' (iframe)' : ''}: ${err?.message}`);
+  }
+}
+
+// Globals or modes changed: rebuild the script and push it to every attached session
+async function refreshFrameGlobals() {
+  frameGlobalsSource = undefined;
+  const jobs = [];
+  for (const tabId of attachedTabs) {
+    jobs.push(installFrameGlobals(tabId));
+    for (const sessionId of childrenOf(tabId)) jobs.push(installFrameGlobals(tabId, sessionId));
+  }
+  await Promise.all(jobs);
+}
 
 let warnedUserScripts = false;
 
 async function syncGlobals() {
+  await syncFrameGuard();
+  await refreshFrameGlobals();
+  await syncUserScriptGlobals();
+}
+
+async function syncUserScriptGlobals() {
   if (!userScriptsAvailable()) {
     if (!warnedUserScripts) {
       warnedUserScripts = true;
@@ -649,7 +1124,8 @@ async function syncGlobals() {
   warnedUserScripts = false;
 
   const { globals: all } = await getConfig();
-  const { [STORAGE_KEY]: states = {} } = await chrome.storage.local.get(STORAGE_KEY);
+  const states = await getStates();
+  const activeDomains = Object.keys(states).filter(d => normalizeState(states[d]) !== STATES.OFF);
   const scripts = [];
   const paused = [];
   for (const [rawDomain, list] of Object.entries(all)) {
@@ -663,7 +1139,7 @@ async function syncGlobals() {
     scripts.push({
       id: `globals:${domain}`,
       matches: [`*://*.${domain}/*`, `*://${domain}/*`],
-      js: [{ code: buildGlobalsCode(list) }],
+      js: [{ code: buildGlobalsCode(list, activeDomains) }],
       runAt: 'document_start',
       world: 'MAIN',
       allFrames: true
@@ -728,6 +1204,22 @@ async function updateIconForActiveTab() {
   updateIcon(state);
 }
 
+// The tab's mode rules its iframes: when it drops the cookie (OFF/PREVIEW), drop the DEV cookie of
+// the domains its iframes come from too, unless that domain is itself in DEV (its own tabs need it)
+async function clearFrameCookies(tabId, tabDomain) {
+  const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
+  const done = new Set([tabDomain]);
+  for (const f of frames || []) {
+    if (!isActionableUrl(f.url)) continue;
+    const domain = extractDomain(f.url);
+    if (!domain || done.has(domain)) continue;
+    done.add(domain);
+    if (STATE_CONFIG[await getState(domain)].cookie) continue;
+    await chrome.cookies.remove({ url: f.url, name: COOKIE_NAME }).catch(() => {});
+    await removePartitionedCookies(domain, null);
+  }
+}
+
 // Handle state change from popup
 async function setState(newState) {
   const normalizedState = normalizeState(newState);
@@ -744,6 +1236,7 @@ async function setState(newState) {
     await scheduleSync();
     await scheduleGlobalsSync();
     await applyConfig(normalizedState, tab.url);
+    if (!STATE_CONFIG[normalizedState].cookie) await clearFrameCookies(tab.id, domain);
     userDetachedTabs.delete(tab.id);
     await ensureReady();
     await syncAllTabs();
@@ -769,6 +1262,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
       respond({
         state,
         domain,
+        blockedBy: (tab && blockedTabs.get(tab.id)) || [],
+        interrupted: (tab && interruptedTabs.get(tab.id)) || null,
         usesMapLocal: await usesMapLocal(state),
         fileAccess: await fileAccessAllowed(),
         globals: domain ? await getGlobals(domain) : [],
@@ -789,6 +1284,32 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     respond(mapLocalStats);
     return false;
   }
+  if (msg.action === 'frameGuardStatus') {
+    const tab = _sender.tab;
+    if (!tab) { respond({ active: false }); return false; }
+    tabStatesFor(tab.id, tab.url).then(states => respond({ active: states.length > 0 })).catch(() => respond({ active: false }));
+    return true;
+  }
+  if (msg.action === 'getActivityLog') {
+    (async () => {
+      const tabs = await chrome.tabs.query({}).catch(() => []);
+      const urlOf = Object.fromEntries(tabs.map(t => [t.id, t.url || '']));
+      respond({
+        log: activityLog,
+        states: await getStates(),
+        fileAccess: await fileAccessAllowed(),
+        userScripts: userScriptsAvailable(),
+        blocked: [...blockedTabs.entries()].filter(([, ids]) => ids.length).map(([id, ids]) => ({ id, url: urlOf[id] || '(closed)', extensions: ids })),
+        tabs: [...attachedTabs].map(id => ({
+          id,
+          url: urlOf[id] || '(closed)',
+          iframes: childrenOf(id).size,
+          patterns: (tabPatterns.get(id) || []).map(p => (p.resourceType ? `${p.urlPattern} [${p.resourceType}]` : p.urlPattern))
+        }))
+      });
+    })();
+    return true;
+  }
 });
 
 // Interception, no-cache rules and globals derive from storage: rebuild whenever it changes.
@@ -796,6 +1317,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 // here as well as for changes arriving from another machine through Chrome sync.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes[STORAGE_KEY]) {
+    invalidateStates();
     scheduleSync();
     ensureReady().then(syncAllTabs);
     // Globals depend on the domain state too (not injected while OFF)
@@ -813,12 +1335,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // 1. Before navigation starts (earliest possible)
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-  if (details.frameId !== 0) return;
   const domain = extractDomain(details.url);
-  if (!domain) return;
+  if (!domain || details.frameId !== 0) return;
 
   // A fresh top-level navigation ends a user-cancelled debugging session's grace period
   userDetachedTabs.delete(details.tabId);
+  attachRetries.delete(details.tabId);
+  interruptedTabs.delete(details.tabId);
   ensureReady().then(() => syncTab(details.tabId, details.url, { reloadAfter: true }));
 
   const state = await getState(domain);
@@ -855,15 +1378,21 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
   const state = await getState(domain);
   await applyConfig(state, details.url);
 
+  // An attach refused while the previous document held another extension's frame: the new
+  // document starts without it, so attach now and reload once to intercept it
+  if (state !== STATES.OFF && !attachedTabs.has(details.tabId) && blockedTabs.has(details.tabId)) {
+    ensureReady().then(() => syncTab(details.tabId, details.url, { reloadAfter: true }));
+  }
+
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (activeTab?.id === details.tabId) updateIcon(state);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  attachedTabs.delete(tabId);
-  tabStates.delete(tabId);
+  forgetTab(tabId);
   userDetachedTabs.delete(tabId);
-  updateKeepAlive();
+  blockedTabs.delete(tabId);
+  interruptedTabs.delete(tabId);
 });
 
 // Update icon when switching tabs
