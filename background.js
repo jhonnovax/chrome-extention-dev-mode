@@ -478,6 +478,7 @@ const tabStates = new Map();       // tabId -> state of the top-level document (
 const tabPatterns = new Map();     // tabId -> Fetch.enable patterns in force ([] = disabled)
 const childSessions = new Map();   // tabId -> Set<sessionId> of auto-attached iframe targets
 const userDetachedTabs = new Set();
+const pendingReload = new Set();   // tabs that navigated while kept detached by "active tab only"
 const warnedUrls = new Set();
 let keepAliveTimer = null;
 
@@ -546,9 +547,15 @@ async function applyPatterns(tabId, patterns, sessionId) {
 // Chrome's refusal to debug a tab holding another extension's frame; reported once by reportBlockedTab
 const isForeignFrameError = (err) => /chrome-extension/i.test(err?.message || '');
 
+// Thrown by enableInterception when the tab stopped qualifying for a session mid-attach
+const isIneligibleError = (err) => /tab not eligible/.test(err?.message || '');
+
 // Root session first (errors propagate), then every known child session
 async function enableInterception(tabId, states) {
   const patterns = await interceptPatterns(states);
+  // The tab may have been switched to OFF (or sent to the background under "active tab only") while
+  // the patterns were being read: that always wins over the attach
+  if (!(await tabStatesFor(tabId)).length) throw new Error('tab not eligible');
   tabPatterns.set(tabId, patterns);
   await applyPatterns(tabId, patterns);
   // Cross-site iframes get their own sessions (Target.attachedToTarget). Idempotent, and re-sent on
@@ -711,13 +718,17 @@ async function reportBlockedTab(tabId, reason) {
 
 // Attach + enable interception. `reloadAfter`: the call comes from a navigation whose document
 // request may already be in flight, so reload once when this call performed a new attach.
+// OFF is re-checked after every await: a mode switch that lands mid-attach must win, otherwise the
+// tab would stay attached (debugging bar, interception) although the popup shows Off.
 async function attachTab(tabId, states, { reloadAfter = false } = {}) {
+  if (!states.length) return detachTab(tabId);
   if (attachedTabs.has(tabId)) {
     try {
       await enableInterception(tabId, states);
       await installFrameGlobals(tabId);
       return;
-    } catch {
+    } catch (err) {
+      if (isIneligibleError(err)) return detachTab(tabId);
       // Session is gone (worker restart, DevTools took over…) — attach again below
       attachedTabs.delete(tabId);
     }
@@ -745,6 +756,12 @@ async function attachTab(tabId, states, { reloadAfter = false } = {}) {
     try {
       await enableInterception(tabId, states);
     } catch (err) {
+      if (isIneligibleError(err)) {
+        console.info(`[Dev Mode] tab ${tabId} switched to OFF or left the foreground during attach, detaching`);
+        // Not detachTab: this job is the in-flight attach it would wait for
+        await forceDetach(tabId);
+        return;
+      }
       console.warn(`[Dev Mode] Fetch.enable failed on tab ${tabId}: ${err?.message}`);
       attachedTabs.delete(tabId);
       updateKeepAlive();
@@ -770,7 +787,7 @@ async function attachTab(tabId, states, { reloadAfter = false } = {}) {
 // Always ask Chrome to detach: the in-memory set is lost when the service worker restarts,
 // but the debugger session is not, so it must not be the only source of truth.
 // Detaching the root session also drops its auto-attached child sessions.
-async function detachTab(tabId) {
+async function forceDetach(tabId) {
   const known = attachedTabs.has(tabId);
   forgetTab(tabId);
   try {
@@ -779,6 +796,13 @@ async function detachTab(tabId) {
   } catch (err) {
     if (known) console.warn(`[Dev Mode] detach tab ${tabId} failed: ${err?.message}`);
   }
+}
+
+// Detach after any attach still in flight for the tab, so a detach requested during an attach is
+// not overtaken by it (Chrome would otherwise keep the session the attach opens)
+async function detachTab(tabId) {
+  if (attaching.has(tabId)) await attaching.get(tabId).catch(() => {});
+  await forceDetach(tabId);
 }
 
 // A new iframe target (cross-site frame) was auto-attached: give it the tab's patterns and globals,
@@ -790,13 +814,20 @@ async function onTargetAttached(tabId, params) {
     : Promise.resolve());
   if (targetInfo?.type !== 'iframe') return resume();
 
+  // An iframe target of a tab that is OFF by now must not resurrect the tab's session
+  const states = await tabStatesFor(tabId);
+  if (!states.length) {
+    await resume();
+    detachTab(tabId);
+    return;
+  }
   childrenOf(tabId).add(sessionId);
   attachedTabs.add(tabId);
   updateKeepAlive();
   console.info(`[Dev Mode] attached iframe ${targetInfo.url || '(no url)'} in tab ${tabId}`);
   try {
     // Interception first (the frame is still paused), then the rest
-    const patterns = tabPatterns.get(tabId) ?? await interceptPatterns(await tabStatesFor(tabId));
+    const patterns = tabPatterns.get(tabId) ?? await interceptPatterns(states);
     tabPatterns.set(tabId, patterns);
     await applyPatterns(tabId, patterns, sessionId);
     console.info(`[Dev Mode] interception on iframe of tab ${tabId}:`, patterns.map(p => p.urlPattern).join(', ') || 'none');
@@ -822,30 +853,58 @@ async function loadAttachedTabs() {
   updateKeepAlive();
 }
 
+// "Debug only the active tab": keep the debugger session only on the active tab of each window.
+// Chrome's debugging bar is browser-wide, so this is the only way to make it disappear while an OFF
+// tab is in front; the price is that a DEV/PREVIEW tab in the background is served from the real
+// site until it is active again. On by default, no UI; hidden per-machine switch for debugging:
+// chrome.storage.local.set({ activeTabOnly: false }) from the worker console.
+const ACTIVE_TAB_ONLY_KEY = 'activeTabOnly';
+let activeTabOnlyCache = null;
+const asActiveTabOnly = (value) => (value === undefined ? true : !!value);
+async function activeTabOnly() {
+  if (activeTabOnlyCache === null) {
+    const stored = await chrome.storage.local.get(ACTIVE_TAB_ONLY_KEY);
+    activeTabOnlyCache = asActiveTabOnly(stored[ACTIVE_TAB_ONLY_KEY]);
+  }
+  return activeTabOnlyCache;
+}
+
 // States a tab needs interception for. The mode picked for the tab's own (top-level) domain rules
 // everything the tab loads: CDN assets and iframes of other domains, whatever their own mode.
-// OFF on the tab means OFF inside its iframes too.
+// OFF on the tab means OFF inside its iframes too; under "active tab only" a background tab counts
+// as OFF. Without `topUrl` the tab's pending URL wins over its current one: while a navigation is
+// pending the tab still reports the previous page, and an attach for a DEV page reached from an OFF
+// page must not be mistaken for OFF.
 async function tabStatesFor(tabId, topUrl) {
-  if (topUrl === undefined) topUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (topUrl === undefined) topUrl = tab?.pendingUrl || tab?.url;
   const state = await stateForUrl(topUrl);
-  return state === STATES.OFF ? [] : [state];
+  if (state === STATES.OFF) return [];
+  if ((await activeTabOnly()) && !tab?.active) return [];
+  return [state];
 }
 
 // Attach or detach a tab according to the mode of its top-level URL
 async function syncTab(tabId, url, { reloadAfter = false } = {}) {
-  tabStates.set(tabId, await stateForUrl(url));
+  const state = await stateForUrl(url);
+  tabStates.set(tabId, state);
   const states = await tabStatesFor(tabId, url);
   if (!states.length) {
+    // A DEV/PREVIEW page loading in a background tab ("active tab only") is not intercepted:
+    // remember to reload it once it comes to the front
+    if (state === STATES.OFF) pendingReload.delete(tabId);
+    else if (reloadAfter) pendingReload.add(tabId);
     await detachTab(tabId);
     return;
   }
   await attachTab(tabId, states, { reloadAfter });
 }
 
-// Re-evaluate every open tab (worker start, settings change)
+// Re-evaluate every open tab (worker start, settings change). Tabs that navigated while kept
+// detached get their pending reload.
 async function syncAllTabs() {
   const tabs = await chrome.tabs.query({});
-  await Promise.all(tabs.map(tab => syncTab(tab.id, tab.url)));
+  await Promise.all(tabs.map(tab => syncTab(tab.id, tab.url, { reloadAfter: pendingReload.delete(tab.id) })));
 }
 
 // Worker startup: learn what Chrome still has attached, then reconcile every tab
@@ -895,7 +954,13 @@ async function onRequestPaused(source, params) {
     const isDocument = params.resourceType === 'Document';
     const state = await requestState(tabId);
     const settings = await getSettings();
-    if (state === STATES.OFF) return finish('Fetch.continueRequest');
+    if (state === STATES.OFF) {
+      // An OFF tab must browse as if the extension were not installed: pass the request through
+      // untouched and end the debugger session that is still delivering events
+      await finish('Fetch.continueRequest');
+      detachTab(tabId);
+      return;
+    }
     // The mode's cookie for the document's own domain, before the request leaves: cookies are added
     // by the network stack after interception, so an iframe from another domain (e.g. an on24 page
     // embedded in a DEV tab of another site) is served in the tab's mode too
@@ -1294,8 +1359,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     (async () => {
       const tabs = await chrome.tabs.query({}).catch(() => []);
       const urlOf = Object.fromEntries(tabs.map(t => [t.id, t.url || '']));
+      // What Chrome itself reports as attached, independent of the in-memory set
+      const chromeAttached = (await chrome.debugger.getTargets().catch(() => []))
+        .filter(t => t.attached)
+        .map(t => ({ tabId: t.tabId ?? null, type: t.type, url: t.url || "" }));
       respond({
         log: activityLog,
+        version: chrome.runtime.getManifest().version,
+        activeTabOnly: await activeTabOnly(),
+        chromeAttached,
         states: await getStates(),
         fileAccess: await fileAccessAllowed(),
         userScripts: userScriptsAvailable(),
@@ -1316,8 +1388,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 // 'local' holds the modes (domainStates); 'sync' holds rules and globals, and fires for edits made
 // here as well as for changes arriving from another machine through Chrome sync.
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes[ACTIVE_TAB_ONLY_KEY]) {
+    activeTabOnlyCache = asActiveTabOnly(changes[ACTIVE_TAB_ONLY_KEY].newValue);
+    console.info(`[Dev Mode] debug only the active tab: ${activeTabOnlyCache ? 'on' : 'off'}`);
+    ensureReady().then(syncAllTabs);
+  }
   if (area === 'local' && changes[STORAGE_KEY]) {
     invalidateStates();
+    // Forget the mode each attached tab was enabled with: the next paused request re-reads it
+    tabStates.clear();
     scheduleSync();
     ensureReady().then(syncAllTabs);
     // Globals depend on the domain state too (not injected while OFF)
@@ -1390,16 +1469,28 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   forgetTab(tabId);
+  pendingReload.delete(tabId);
   userDetachedTabs.delete(tabId);
   blockedTabs.delete(tabId);
   interruptedTabs.delete(tabId);
 });
 
-// Update icon when switching tabs
-chrome.tabs.onActivated.addListener(() => updateIconForActiveTab());
+// Tab switch: icon, and under "active tab only" move the debugger session to the tab now in front.
+// Chrome's activeInfo has no previousTabId (Firefox only), so every tab of the window is re-checked:
+// the background ones detach, the active one attaches (reloaded if it navigated while detached).
+chrome.tabs.onActivated.addListener(async ({ windowId }) => {
+  updateIconForActiveTab();
+  if (!(await activeTabOnly())) return;
+  await ensureReady();
+  const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+  await Promise.all(tabs.map(tab =>
+    syncTab(tab.id, tab.pendingUrl || tab.url, { reloadAfter: tab.active && pendingReload.delete(tab.id) }).catch(() => {})
+  ));
+});
 
 // Initialize
 function init() {
+  activeTabOnly().then(on => console.info(`[Dev Mode] worker started v${chrome.runtime.getManifest().version}, debug only the active tab: ${on ? "on" : "off"}`));
   updateIconForActiveTab();
   scheduleSync();
   scheduleGlobalsSync();

@@ -320,7 +320,10 @@ async function renderActivity() {
   const tabs = data.tabs.length
     ? data.tabs.map(t => `  tab ${t.id} ${t.url}\n    iframes attached: ${t.iframes} · patterns: ${t.patterns.join(', ') || 'none'}`).join('\n')
     : '  none';
-  summary.textContent = `modes: ${modes}\nfile access: ${data.fileAccess} · user scripts: ${data.userScripts}\ndebugged tabs:\n${tabs}`;
+  const chromeAttached = (data.chromeAttached || []).length
+    ? data.chromeAttached.map(t => `  ${t.type} tab ${t.tabId ?? "?"} ${t.url}`).join("\n")
+    : "  none";
+  summary.textContent = `worker: v${data.version || "?"} · debug only the active tab: ${data.activeTabOnly ? "on" : "off"}\nmodes: ${modes}\nfile access: ${data.fileAccess} · user scripts: ${data.userScripts}\ndebugged tabs:\n${tabs}\nsessions Chrome reports attached:\n${chromeAttached}`;
 
   logEl.textContent = '';
   for (const line of data.log) {
