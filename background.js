@@ -125,6 +125,23 @@ function isActionableUrl(url) {
   return typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'));
 }
 
+// SSO/OAuth URLs carry one-time tokens or start a handshake: reloading them breaks the login
+// (e.g. ERROR_SWAPPING_TOKEN), so the reload after a fresh attach is skipped for them
+const ONE_SHOT_PATH = /\/(saml|sso|oauth2?|oidc|auth|login|callback|acs)(\/|$)/i;
+const ONE_SHOT_PARAMS = ['token', 'code', 'state', 'ticket', 'SAMLResponse', 'SAMLRequest', 'RelayState', 'id_token', 'access_token'];
+const lastCommit = new Map(); // tabId -> { url, transitionType } of the last top-level commit
+
+function isOneShotUrl(url) {
+  try {
+    const u = new URL(url);
+    const oneShot = ONE_SHOT_PATH.test(u.pathname) || ONE_SHOT_PARAMS.some(p => u.searchParams.has(p));
+    if (oneShot) console.info(`[Dev Mode] one-time auth URL, no reload after attach: ${url}`);
+    return oneShot;
+  } catch {
+    return false;
+  }
+}
+
 // Extract root domain from URL
 function extractDomain(url) {
   try {
@@ -769,7 +786,11 @@ async function attachTab(tabId, states, { reloadAfter = false } = {}) {
     }
     await disableCache(tabId);
     await installFrameGlobals(tabId);
-    if (reloadAfter) {
+    const commit = lastCommit.get(tabId);
+    if (reloadAfter && commit?.transitionType === 'form_submit') {
+      // An IdP auto-submitting a SAML form: a reload would replay the one-time POST
+      console.info(`[Dev Mode] not reloading tab ${tabId}: form submission ${commit.url}`);
+    } else if (reloadAfter) {
       console.info(`[Dev Mode] reloading tab ${tabId} so the document is intercepted`);
       // Plain reload: a cache-bypassing reload makes some on24 pages answer 404
       chrome.tabs.reload(tabId).catch(() => {});
@@ -1421,7 +1442,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   userDetachedTabs.delete(details.tabId);
   attachRetries.delete(details.tabId);
   interruptedTabs.delete(details.tabId);
-  ensureReady().then(() => syncTab(details.tabId, details.url, { reloadAfter: true }));
+  ensureReady().then(() => syncTab(details.tabId, details.url, { reloadAfter: !isOneShotUrl(details.url) }));
 
   const state = await getState(domain);
   await applyConfig(state, details.url);
@@ -1442,7 +1463,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
   const state = await getState(domain);
   await ensureReady();
-  await syncTab(tabId, changeInfo.url, { reloadAfter: true });
+  await syncTab(tabId, changeInfo.url, { reloadAfter: !isOneShotUrl(changeInfo.url) });
   await applyConfig(state, changeInfo.url);
 
   if (tab.active) updateIcon(state);
@@ -1451,6 +1472,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // 3. When navigation commits (ensures config is applied)
 chrome.webNavigation.onCommitted.addListener(async (details) => {
   if (details.frameId !== 0) return;
+  lastCommit.set(details.tabId, { url: details.url, transitionType: details.transitionType });
   const domain = extractDomain(details.url);
   if (!domain) return;
 
@@ -1473,6 +1495,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   userDetachedTabs.delete(tabId);
   blockedTabs.delete(tabId);
   interruptedTabs.delete(tabId);
+  lastCommit.delete(tabId);
 });
 
 // Tab switch: icon, and under "active tab only" move the debugger session to the tab now in front.
