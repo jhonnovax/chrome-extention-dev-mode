@@ -24,16 +24,15 @@ const globalsName = document.getElementById('globals-name');
 const globalsValue = document.getElementById('globals-value');
 
 let globals = [];
-let globalsMeta = { domain: null, userScripts: true, state: 'off' };
+let globalsMeta = { domain: null, state: 'off' };
 
 function renderGlobals(list, meta = {}) {
   globals = Array.isArray(list) ? list : [];
   globalsMeta = { ...globalsMeta, ...meta };
-  const { domain, userScripts, state } = globalsMeta;
+  const { domain, state } = globalsMeta;
   const disabled = state === 'off';
 
   globalsEl.hidden = !domain;
-  globalsEl.classList.toggle('unsupported', userScripts === false);
   globalsEl.classList.toggle('disabled', disabled);
   globalsName.disabled = disabled;
   globalsValue.disabled = disabled;
@@ -93,10 +92,6 @@ globalsForm.addEventListener('submit', (event) => {
   saveGlobals(next);
 });
 
-document.getElementById('globals-hint').addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'openExtensionDetails' });
-  window.close();
-});
 
 // Get current state and update UI
 async function updateUI() {
@@ -110,7 +105,7 @@ async function updateUI() {
 
   updateFileAccess(response);
   updateBlocked(response?.blockedBy || [], response?.interrupted);
-  renderGlobals(response?.globals, { domain: response?.domain, userScripts: response?.userScripts, state: currentState });
+  renderGlobals(response?.globals, { domain: response?.domain, state: currentState });
 }
 
 // Chrome refuses to debug a tab that contains a frame of another extension: nothing works there until it is off
