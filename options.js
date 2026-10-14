@@ -316,14 +316,14 @@ async function renderActivity() {
     summary.textContent = 'Worker not running (it starts on the next navigation).';
     return;
   }
-  const modes = Object.entries(data.states || {}).map(([d, s]) => `${d}=${s}`).join(', ') || 'none';
+  const modes = (data.modes || []).map(m => `tab ${m.id}=${m.mode} ${m.url}`).join('\n  ') || 'all tabs off';
   const tabs = data.tabs.length
     ? data.tabs.map(t => `  tab ${t.id} ${t.url}\n    iframes attached: ${t.iframes} · patterns: ${t.patterns.join(', ') || 'none'}`).join('\n')
     : '  none';
   const chromeAttached = (data.chromeAttached || []).length
     ? data.chromeAttached.map(t => `  ${t.type} tab ${t.tabId ?? "?"} ${t.url}`).join("\n")
     : "  none";
-  summary.textContent = `worker: v${data.version || "?"} · debug only the active tab: ${data.activeTabOnly ? "on" : "off"}\nmodes: ${modes}\nfile access: ${data.fileAccess} · user scripts: ${data.userScripts}\ndebugged tabs:\n${tabs}\nsessions Chrome reports attached:\n${chromeAttached}`;
+  summary.textContent = `worker: v${data.version || "?"} · debug only the active tab: ${data.activeTabOnly ? "on" : "off"}\ntab modes (this browser session only):\n  ${modes}\nfile access: ${data.fileAccess}\ndebugged tabs:\n${tabs}\nsessions Chrome reports attached:\n${chromeAttached}`;
 
   logEl.textContent = '';
   for (const line of data.log) {

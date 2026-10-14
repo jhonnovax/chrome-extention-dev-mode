@@ -382,20 +382,6 @@
     .globals .btn.remove:hover { color: #D32F2F; }
     .globals .btn.add:hover { color: #00a344; }
 
-    .globals .hint {
-      display: none;
-      margin: 2px 0 6px;
-      font-size: 11px;
-      color: #c62828;
-      cursor: pointer;
-    }
-
-    .globals.unsupported .hint { display: block; }
-    .globals .hint:hover { text-decoration: underline; }
-
-    @media (prefers-color-scheme: dark) {
-      .globals .hint { color: #ef9a9a; }
-    }
 
     /* OFF: variables are kept but not injected, so the whole section is grayed out */
     .globals.disabled .status { display: inline-block; }
@@ -443,7 +429,6 @@
       <span class="title">Globals</span>
       <span class="status" title="Switch to Development or Preview to inject these variables">Not injected while Off</span>
     </div>
-    <span class="hint" id="globals-hint" title="Open extension details">Enable “Allow User Scripts” in extension details</span>
     <div class="list" id="globals-list"></div>
     <form class="row" id="globals-add" autocomplete="off">
       <input type="text" id="globals-name" placeholder="isFlagEnabled" spellcheck="false">

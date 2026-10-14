@@ -84,12 +84,6 @@
     }
   });
 
-  // Pages of active domains start right away (frame-guard-now.js sets the flag, in either order)
-  window.__devModeFrameGuardStart = start;
-  if (window.__devModeFrameGuardNow) {
-    start();
-    return;
-  }
   try {
     chrome.runtime.sendMessage({ action: 'frameGuardStatus' }, (res) => {
       if (chrome.runtime.lastError) return;
